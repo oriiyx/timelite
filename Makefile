@@ -15,8 +15,11 @@ build:
 build/timelite.o: timelite.c timelite.h Makefile | build
 	$(CC) $(CPPFLAGS) -I. $(CFLAGS) -c timelite.c -o $@
 
-build/libtimelite.a: build/timelite.o
-	$(AR) rcs $@ $<
+build/file_io.o: file_io.c file_io.h Makefile | build
+	$(CC) $(CPPFLAGS) -I. $(CFLAGS) -c file_io.c -o $@
+
+build/libtimelite.a: build/timelite.o build/file_io.o
+	$(AR) rcs $@ $^
 
 build/basic.o: examples/basic.c timelite.h Makefile | build
 	$(CC) $(CPPFLAGS) -I. $(CFLAGS) -c examples/basic.c -o $@
@@ -24,9 +27,16 @@ build/basic.o: examples/basic.c timelite.h Makefile | build
 build/basic: build/basic.o build/libtimelite.a
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ build/basic.o build/libtimelite.a $(LDLIBS)
 
-# Run the example to check that the library builds and links.
-check: all
+build/file_io_test: tests/file_io_test.c file_io.h build/libtimelite.a Makefile
+	$(CC) $(CPPFLAGS) -I. $(CFLAGS) $(LDFLAGS) tests/file_io_test.c build/libtimelite.a $(LDLIBS) -o $@
+
+build/file_io_fault_test: tests/file_io_fault_test.c tests/file_io_calls.h file_io.c file_io.h Makefile | build
+	$(CC) $(CPPFLAGS) -DTIMELITE_IO_TEST -I. $(CFLAGS) $(LDFLAGS) file_io.c tests/file_io_fault_test.c $(LDLIBS) -o $@
+
+check: all build/file_io_test build/file_io_fault_test
 	./build/basic
+	./build/file_io_test
+	./build/file_io_fault_test
 
 clean:
 	rm -rf build

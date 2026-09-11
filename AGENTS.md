@@ -3,8 +3,9 @@
 ## Project
 
 Timelite is a small embedded time-series database project written in C99.
-The current code is only a buildable library skeleton. Storage and queries are
-future work. Read README.md and the relevant docs/feature notes before editing.
+The current code is a buildable library skeleton with internal POSIX file I/O.
+Database storage formats and queries are future work. Read README.md and the
+relevant docs/feature notes before editing.
 The earlier research is in research/RESEARCH.md; it contains proposals, not all
 of which have been accepted. These instructions describe the current direction.
 
@@ -22,6 +23,9 @@ Use simple, explicit C99 in the style requested by the user:
 - Use clear names and short comments that explain intent or a non-obvious rule.
   Write for a junior developer. Avoid jargon, clever wording, and comments that
   only repeat the code.
+- Keep internal file operations in file_io.c/file_io.h, separate from timelite.h.
+  Linux is provisional and macOS is the development target; Windows file I/O is
+  deferred. Preserve the Windows public-library smoke build.
 - Keep the core in timelite.c and the public declarations in timelite.h while
   that remains easy to understand. Split files when there is a concrete need.
 - Add no third-party dependency without a concrete reason and agreement on scope.
@@ -61,13 +65,15 @@ Use simple, explicit C99 in the style requested by the user:
 ## Build and verification
 
 - Run make check for a normal local check. It builds the static library and runs
-  the example; it is a smoke check, not a database test suite.
+  the example plus file-I/O integration and fault tests; it is not a database
+  test suite.
 - Keep builds warning-free under the default strict C99 flags.
 - When changing compiler flags, run make clean first; Make does not track changes
   to command-line variables. CC and AR can be overridden on the make command line.
 - Add focused tests as real behavior appears. Storage changes need failure and
   recovery tests; do not add tests that merely duplicate trivial implementation.
-- GitHub Actions checks Linux and macOS with Make and Windows with Clang directly.
+- GitHub Actions checks Linux and macOS with Make, Linux x86 32-bit file offsets, and
+  Windows with Clang directly (public library only).
   Report local results separately from CI and device results. Never claim unrun
   checks passed.
 - Do not add database features as part of unrelated setup or documentation work.

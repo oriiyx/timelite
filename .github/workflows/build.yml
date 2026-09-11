@@ -20,8 +20,18 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Build and run example
+      - name: Build and run example and file I/O tests
         run: make check
+
+  linux_32:
+    name: C99 (Linux x86 32-bit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install 32-bit compiler support
+        run: sudo apt-get update && sudo apt-get install -y gcc-multilib
+      - name: Build and test with 64-bit file offsets
+        run: make CC="gcc -m32" check
 
   windows:
     name: C99 (Windows)

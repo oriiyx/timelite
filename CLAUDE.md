@@ -14,5 +14,7 @@ In particular:
   change. Keep shared rules in AGENTS.md so these files do not drift apart.
 - Update the README when usage changes. Report only checks actually performed.
 
-The project currently has a library skeleton, not a working database. Do not
-implement storage or queries unless the task calls for them.
+The project has a library skeleton and internal Linux/macOS file I/O, not a
+working database. Keep the internal file layer separate from the public API and
+preserve the Windows library smoke build. Do not implement database storage
+formats or queries unless the task calls for them.
