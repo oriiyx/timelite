@@ -71,3 +71,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./build/lifecycle_fault_test.exe
           exit $LASTEXITCODE
+      - name: Build and run batch tests
+        shell: pwsh
+        run: |
+          clang --target=x86_64-pc-windows-msvc -std=c99 -Wall -Wextra -Wpedantic -Werror -I. timelite.c file_io_windows.c examples/batches.c -o build/batches.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          clang --target=x86_64-pc-windows-msvc -std=c99 -Wall -Wextra -Wpedantic -Werror -I. timelite.c file_io_windows.c tests/batch_test.c -o build/batch_test.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./build/batch_test.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          clang --target=x86_64-pc-windows-msvc -std=c99 -Wall -Wextra -Wpedantic -Werror -I. timelite.c tests/batch_model_test.c -o build/batch_model_test.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./build/batch_model_test.exe
+          exit $LASTEXITCODE

@@ -1,9 +1,10 @@
 # Timelite
 
 A small embedded time-series database project in C99. The current version is a
-library with database initialization, create/open/close, and header validation,
-backed by internal POSIX and Windows file I/O.
-It does not store or query data yet.
+library with durable sensor batch append, recovery, and sequential reading from a
+separate WAL on supported local POSIX filesystems. The original v1 lifecycle API
+remains available. Windows retains lifecycle and file I/O; durable batch
+provisioning currently returns `ENOTSUP`. Checkpointing is deferred to feature 005.
 
 The direction is a small C API, explicit memory ownership, no third-party
 dependencies, and a narrow scope for sensor history. Target devices include x86
@@ -17,8 +18,9 @@ On Linux or macOS, install a C99 compiler, Make, and ar, then run:
 make check
 ```
 
-This creates build/libtimelite.a, build/basic, and file-I/O and database lifecycle test programs.
-It runs the example (shown below), temporary-file tests, and deterministic file-I/O and lifecycle fault tests:
+This creates build/libtimelite.a, build/basic, build/batches, and storage test programs.
+It runs the example (shown below), temporary-file tests, deterministic file-I/O, lifecycle and provisioning fault tests,
+and a volatile/persisted batch storage model:
 
 ```text
 Timelite 0.1.0-dev
@@ -58,6 +60,160 @@ Server 2022 x64, and a Linux x86 32-bit job. Windows CI records OS and Clang
 versions and installed SDKs. Windows runtime/SDK validation is pending; local
 Windows checks so far are MinGW-w64 cross-compilation only. CI runs are separate
 from validation on the target devices.
+
+## Durable sensor batches (v2)
+
+The complete example below is also [examples/batches.c](examples/batches.c).
+Build it with `make`, then run `./build/batches DATABASE WAL` using two unused
+paths in an existing, stable, already-durable local directory. It creates a pair,
+appends one batch, closes, reopens, and reads the committed batch. It leaves both
+files in place. On unsupported provisioning, including Windows, creation returns
+an error; partial artifacts may remain and are never automatically deleted.
+
+```c
+#include "timelite.h"
+#include <stdio.h>
+#include <inttypes.h>
+
+/* Supply two unused paths in a stable, already-durable local directory. */
+int main(int argc, char **argv)
+{
+    struct timelite_batches db;
+    struct timelite_record input[] = {{7, UINT64_C(1700000000000000), 23500}};
+    struct timelite_record output[TIMELITE_MAX_RECORDS];
+    unsigned char scratch[TIMELITE_BATCH_SCRATCH];
+    uint64_t sequence;
+    size_t count, i;
+    int error, close_error;
+    if (argc != 3)
+    {
+        fprintf(stderr, "usage: %s DATABASE WAL\n", argv[0]);
+        return 1;
+    }
+    (void)timelite_batches_init(&db);
+    error = timelite_batches_open(&db, argv[1], argv[2], TIMELITE_CREATE_NEW,
+                                  scratch, sizeof(scratch));
+    if (error != 0)
+    {
+        fprintf(stderr, "create failed: %d (partial files may remain)\n", error);
+        return 1;
+    }
+    /* Application convention: series 7 measures thousandths of a degree C. */
+    error = timelite_batches_append(&db, input, 1, scratch, sizeof(scratch), &sequence);
+    close_error = timelite_batches_close(&db);
+    if (error != 0)
+    {
+        fprintf(stderr, "append failed: %d; reopen and inspect before retrying\n", error);
+        return 1;
+    }
+    if (close_error != 0)
+    {
+        fprintf(stderr, "close failed: %d; handle consumed, do not retry close\n", close_error);
+        return 1;
+    }
+    error = timelite_batches_open(&db, argv[1], argv[2], TIMELITE_OPEN_EXISTING,
+                                  scratch, sizeof(scratch));
+    if (error != 0)
+    {
+        fprintf(stderr, "reopen failed: %d\n", error);
+        return 1;
+    }
+    while ((error = timelite_batches_next(&db, output, TIMELITE_MAX_RECORDS,
+                                          &count, &sequence, scratch,
+                                          sizeof(scratch))) == 0)
+    {
+        for (i = 0; i < count; i++)
+        {
+            printf("batch=%" PRIu64 " series=%" PRIu32 " us=%" PRIu64
+                   " value=%" PRId64 "\n", sequence, output[i].series,
+                   output[i].timestamp_us, output[i].value);
+        }
+    }
+    close_error = timelite_batches_close(&db);
+    if (error != TIMELITE_END || close_error != 0)
+    {
+        fprintf(stderr, "read/close failed: %d/%d\n", error, close_error);
+        return 1;
+    }
+    return 0;
+}
+```
+
+Each reading has a 32-bit series identifier, unsigned 64-bit microseconds since
+the Unix epoch, and signed 64-bit integer value. The application chooses units
+(e.g. thousandths of a degree); no floating-point representation is assumed.
+All field values are valid, including series zero. Input order and duplicate
+series/timestamps are preserved, with no ordering requirement or deduplication.
+Empty batches and more than 64 readings return `EINVAL` before writes.
+
+Caller owns the handle, records and scratch. Every batch operation takes at least
+`TIMELITE_BATCH_SCRATCH` (1344) scratch bytes. Output capacity is in records;
+64 records always suffice. Public struct size can include platform padding;
+encoded records are exactly 20 bytes. No allocation, retained buffers, global
+mutable production state, threads, or locks. Buffers/outputs and handles must not
+overlap. Calls and filesystem ownership must remain serialized; do not copy an
+open handle or externally modify, rename, replace or delete its files/directories.
+
+The WAL limit is 64 MiB including its 32-byte header. A batch occupies
+64 + 20 × record count bytes (84..1344). `TIMELITE_WAL_FULL` rejects a batch
+before writes; committed data is never overwritten or reclaimed. Feature 005
+must checkpoint into main storage before reclaiming WAL capacity. This feature
+provides no rotation, retention, segments, indexes or queries beyond batch reading.
+
+`timelite_batches_next` returns only whole validated batches. `TIMELITE_END`
+means the cursor reached currently committed data; later serialized appends are
+visible at that cursor. `timelite_batches_rewind` restarts at sequence 1.
+`TIMELITE_BUFFER_TOO_SMALL` leaves cursor and output unchanged, allowing retry
+with larger buffers. Errors and END leave count, sequence and record outputs
+unchanged; scratch contents are unspecified. A successful append returns the
+next sequence, starting at 1. Reopen derives that sequence from validated commits.
+
+Positive returns are errno values; negative returns are Timelite results declared
+in [timelite.h](timelite.h). Argument/buffer/capacity rejection leaves the handle
+usable. Any append write or sync error poisons reads and appends with
+`TIMELITE_RECOVERY_REQUIRED` until close/reopen. The failed batch may still be
+committed: enumerate sequences and contents after reopen before deciding to retry.
+Identical contents cannot distinguish independent identical readings from a retry;
+there is no exactly-once promise. Close consumes both resources even on failure;
+never retry native close. Cleanup preserves the primary error and deletes nothing.
+
+Creation requires both names to be unused. Existing opens require both members;
+open-or-create never repairs a missing member of an existing pair. Partial
+creation may leave empty, partial or complete files. v2 headers associate the pair
+using an OS-random 128-bit identity and integrity checks. Different identities
+return `TIMELITE_PAIR_MISMATCH` before modification. Copy/backup both files only
+while closed; independently writable copies must not be mixed. Random identity
+collision is improbable, not mathematically impossible or tamper protection.
+
+The v1 12-byte format and `timelite_open` API retain their original behavior.
+The v2 API rejects v1 with `TIMELITE_UNSUPPORTED_VERSION`; the v1 API likewise
+rejects v2. Migration is deferred; no automatic upgrade or file deletion occurs.
+
+Durable success requires a local filesystem supporting the specified flush
+operations: macOS APFS/HFS+ or Linux ext-family/XFS/Btrfs are admitted; other types
+return `ENOTSUP`. This is a protocol boundary, not certification of every mount,
+OS version or device. Linux uses file `fdatasync` and parent-directory `fsync`;
+macOS uses directory `fsync` followed by file `F_FULLFSYNC` to request device-cache
+flushing. Every open repeats provisioning and checks the final directory entries
+against the opened files. Final-component symlinks are rejected. Directory
+ancestry must already be durable, and paths must remain stable until close.
+Unsupported/failed flushes return errors without a weaker fallback. Windows has
+no implemented namespace durability protocol, so valid batch opens/creation
+cannot succeed there yet; existing file-I/O and v1 operations still work.
+
+Storage must honor flushes and ordering, preserve previously synced bytes during
+later writes (including writes to the same physical sector), and preserve the
+synced namespace. No universal power-loss guarantee follows from an OS flush.
+Recovery checks complete framing, sequence and checksums, then truncates/syncs
+only a suffix with a valid header declaring a batch beyond EOF. A short or damaged
+header, complete bad commit, or damaged committed payload fails closed. An
+interrupted append can therefore require manual investigation if its header is
+partial. Arbitrary external truncation is outside the recovery model: it cannot
+be distinguished from an interrupted uncommitted suffix. Checksums detect
+accidental damage with finite collision probability, not malicious edits.
+
+See [feature 004](docs/feature/004-durable-batch.md) for exact encoding, failure
+boundaries, official durability sources, and separate verification results.
 
 ## Database lifecycle
 
@@ -106,8 +262,8 @@ success does not promise durable creation under power loss. Reopen proves only
 visibility. See [feature 003](docs/feature/003-database-lifecycle.md) for exact
 validation order, ownership, format evolution and the proposed WAL contract.
 
-WAL is the intended default for future durable batch appends. WAL, record storage,
-recovery and checkpointing are specification only and are not implemented.
+The separate v2 batch API above implements WAL append and recovery. Checkpointing
+and main-storage segments remain deferred to feature 005.
 
 ## Internal file I/O
 
@@ -146,9 +302,11 @@ Explicit sync uses Linux `fdatasync` or macOS `F_FULLFSYNC`, reporting failures
 without a weaker fallback. Windows uses `FlushFileBuffers` to request flushing
 buffered file information to the device, reporting failure without fallback.
 There is no claim that these OS requests have identical durability semantics.
-The layer does not sync the parent directory, so creation
-alone plus file sync does not promise a durable directory entry. Close is not
-sync. There is no database commit, atomic-write, recovery, or power-loss guarantee.
+Ordinary file create/sync does not sync the parent directory. The separate internal
+`timelite_file_provision` operation used by v2 checks association and syncs the
+parent directory; ordinary creation alone has no durable directory-entry promise. Close is not
+sync. These legacy file operations alone provide no database commit or recovery guarantee.
+The v2 batch API adds the qualified protocol described above.
 Reopen tests check visibility only. Official sync references and detailed limits
 are in [feature 001](docs/feature/001-file-io.md).
 
@@ -160,6 +318,7 @@ are in [feature 001](docs/feature/001-file-io.md).
 - file_io.c and file_io_windows.c: POSIX and Windows implementations.
 - tests/: temporary-file and deterministic syscall fault tests.
 - examples/basic.c: a small application that calls the library.
+- examples/batches.c: complete v2 create/append/read/reopen application.
 - [AGENTS.md](AGENTS.md) and [CLAUDE.md](CLAUDE.md): coding-agent instructions.
 - [docs/feature/000-init.md](docs/feature/000-init.md): bootstrap scope and results.
 - [docs/feature/003-database-lifecycle.md](docs/feature/003-database-lifecycle.md): lifecycle, header, failure analysis and future WAL contract.

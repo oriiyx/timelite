@@ -345,3 +345,17 @@ int timelite_file_close(struct timelite_file *file)
     }
     return 0;
 }
+
+/* File flush alone supplies no supported namespace provisioning contract. */
+int timelite_file_identity(unsigned char identity[16])
+{
+    (void)identity;
+    return ENOTSUP;
+}
+
+int timelite_file_provision(struct timelite_file *file, const char *path)
+{
+    (void)file;
+    (void)path;
+    return ENOTSUP;
+}

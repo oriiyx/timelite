@@ -67,4 +67,11 @@ int timelite_file_sync(struct timelite_file *file);
  * Close is not sync. A second close returns EBADF. */
 int timelite_file_close(struct timelite_file *file);
 
+/* Feature 004: random identity and durable namespace provisioning. Provision
+ * requires a stable trusted path and previously durable directory ancestry.
+ * Checks the opened file against the final directory entry and syncs both.
+ * Unsupported platforms/filesystems return ENOTSUP without weaker fallback. */
+int timelite_file_identity(unsigned char identity[16]);
+int timelite_file_provision(struct timelite_file *file, const char *path);
+
 #endif

@@ -205,3 +205,21 @@ int main(void)
     puts("database lifecycle faults: passed");
     return 0;
 }
+
+int timelite_file_identity(unsigned char identity[16])
+{
+    (void)identity;
+    return ENOTSUP;
+}
+int timelite_file_provision(struct timelite_file *file, const char *path)
+{
+    (void)file;
+    (void)path;
+    return ENOTSUP;
+}
+int timelite_file_truncate(struct timelite_file *file, uint64_t size)
+{
+    (void)file;
+    (void)size;
+    return ENOTSUP;
+}

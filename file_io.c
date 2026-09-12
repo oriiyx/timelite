@@ -281,3 +281,120 @@ int timelite_file_close(struct timelite_file *file)
     }
     return 0;
 }
+
+#ifndef TIMELITE_IO_TEST
+#include <string.h>
+#if defined(__APPLE__)
+#include <sys/mount.h>
+#else
+#include <sys/vfs.h>
+#endif
+
+#include <sys/random.h>
+#ifdef TIMELITE_PROVISION_TEST
+#include "tests/provision_calls.h"
+#endif
+
+int timelite_file_identity(unsigned char identity[16])
+{
+#if defined(__APPLE__)
+    return getentropy(identity, 16) == 0 ? 0 : errno;
+#else
+    ssize_t count;
+    do
+    {
+        count = getrandom(identity, 16, GRND_NONBLOCK);
+    } while (count < 0 && errno == EINTR);
+    return count < 0 ? errno : count == 16 ? 0 : EIO;
+#endif
+}
+
+int timelite_file_provision(struct timelite_file *file, const char *path)
+{
+    char parent[4096];
+    const char *name;
+    const char *slash;
+    struct stat opened, named;
+    struct statfs filesystem;
+    size_t length;
+    int directory, result;
+    int error = check_file(file);
+    if (error != 0 || path == NULL)
+    {
+        return error != 0 ? error : EINVAL;
+    }
+    slash = strrchr(path, '/');
+    name = slash == NULL ? path : slash + 1;
+    length = slash == NULL ? 1 : (size_t)(slash - path);
+    if (length == 0)
+    {
+        length = 1;
+    }
+    if (length >= sizeof(parent) || name[0] == '\0')
+    {
+        return ENAMETOOLONG;
+    }
+    memcpy(parent, slash == NULL ? "." : path, length);
+    parent[length] = '\0';
+    directory = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory < 0)
+    {
+        return errno;
+    }
+    if (fstat(file->fd, &opened) < 0 ||
+        fstatat(directory, name, &named, AT_SYMLINK_NOFOLLOW) < 0 ||
+        fstatfs(file->fd, &filesystem) < 0)
+    {
+        error = errno;
+    }
+    else if (!S_ISREG(named.st_mode) || opened.st_dev != named.st_dev ||
+             opened.st_ino != named.st_ino)
+    {
+        error = EINVAL;
+    }
+#if defined(__APPLE__)
+    else if (strcmp(filesystem.f_fstypename, "apfs") != 0 &&
+             strcmp(filesystem.f_fstypename, "hfs") != 0)
+#else
+    /* ext4/ext3/ext2 family, XFS and Btrfs; remote and volatile FS excluded. */
+    else if ((unsigned long)filesystem.f_type != 0xef53UL && (unsigned long)filesystem.f_type != 0x58465342UL &&
+             (unsigned long)filesystem.f_type != 0x9123683eUL)
+#endif
+    {
+        error = ENOTSUP;
+    }
+    if (error == 0)
+    {
+        error = timelite_file_sync(file);
+    }
+    if (error == 0)
+    {
+        do
+        {
+            result = fsync(directory);
+        } while (result < 0 && errno == EINTR);
+        error = result < 0 ? errno : 0;
+    }
+#if defined(__APPLE__)
+    if (error == 0)
+    {
+        /* Flush device caches after the directory metadata has been submitted. */
+        error = timelite_file_sync(file);
+    }
+#endif
+    if (error == 0 && (fstatat(directory, name, &named, AT_SYMLINK_NOFOLLOW) < 0))
+    {
+        error = errno;
+    }
+    if (error == 0 && (!S_ISREG(named.st_mode) || opened.st_dev != named.st_dev ||
+                       opened.st_ino != named.st_ino))
+    {
+        error = EINVAL;
+    }
+    if (close(directory) < 0 && error == 0)
+    {
+        error = errno;
+    }
+    return error;
+}
+#endif

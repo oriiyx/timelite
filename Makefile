@@ -7,7 +7,7 @@ LDLIBS =
 
 .PHONY: all check clean
 
-all: build/libtimelite.a build/basic
+all: build/libtimelite.a build/basic build/batches
 
 build:
 	mkdir -p build
@@ -39,7 +39,22 @@ build/lifecycle_test: tests/lifecycle_test.c timelite.h file_io.h build/libtimel
 build/lifecycle_fault_test: tests/lifecycle_fault_test.c timelite.c timelite.h file_io.h Makefile | build
 	$(CC) $(CPPFLAGS) -I. $(CFLAGS) $(LDFLAGS) timelite.c tests/lifecycle_fault_test.c $(LDLIBS) -o $@
 
-check: all build/file_io_test build/file_io_fault_test build/lifecycle_test build/lifecycle_fault_test
+build/batches: examples/batches.c timelite.h build/libtimelite.a Makefile
+	$(CC) $(CPPFLAGS) -I. $(CFLAGS) $(LDFLAGS) examples/batches.c build/libtimelite.a $(LDLIBS) -o $@
+
+build/batch_test: tests/batch_test.c timelite.h file_io.h build/libtimelite.a Makefile
+	$(CC) $(CPPFLAGS) -I. $(CFLAGS) $(LDFLAGS) tests/batch_test.c build/libtimelite.a $(LDLIBS) -o $@
+
+build/batch_model_test: tests/batch_model_test.c timelite.c timelite.h file_io.h Makefile | build
+	$(CC) $(CPPFLAGS) -I. $(CFLAGS) $(LDFLAGS) timelite.c tests/batch_model_test.c $(LDLIBS) -o $@
+
+build/provision_fault_test: tests/provision_fault_test.c tests/provision_calls.h file_io.c file_io.h Makefile | build
+	$(CC) $(CPPFLAGS) -DTIMELITE_PROVISION_TEST -I. $(CFLAGS) $(LDFLAGS) file_io.c tests/provision_fault_test.c $(LDLIBS) -o $@
+
+check: all build/provision_fault_test build/batch_test build/batch_model_test build/file_io_test build/file_io_fault_test build/lifecycle_test build/lifecycle_fault_test
+	./build/provision_fault_test
+	./build/batch_test
+	./build/batch_model_test
 	./build/basic
 	./build/file_io_test
 	./build/file_io_fault_test

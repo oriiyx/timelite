@@ -3,11 +3,13 @@
 ## Project
 
 Timelite is a small embedded time-series database project written in C99.
-The current code implements caller-owned database lifecycle and a 12-byte v1
-header, with internal POSIX and Windows file I/O. Record storage and queries are
-future work. WAL is the accepted default for future durable batch appends; WAL
-and recovery are currently specification only (feature 003). Creation syncs the
-file but does not promise durable directory entries or power-loss creation.
+The code implements v1 lifecycle plus a separate v2 durable sensor batch API,
+with a paired WAL, recovery and sequential batch reading. The WAL is capped at
+64 MiB; checkpointing/main storage/reclamation are deferred to feature 005.
+Batch operations use caller-owned scratch, integer records and serialized ownership.
+Durable provisioning is implemented for selected local Linux/macOS filesystems;
+Windows batch provisioning explicitly returns ENOTSUP. v1 creation retains its
+original file-sync-only contract. No automatic format migration is provided.
 Read README.md and the relevant docs/feature notes before editing. Earlier research
 was removed from main; historical proposals are not automatically accepted
 requirements. These instructions describe the current direction.
@@ -71,8 +73,9 @@ Use simple, explicit C99 in the style requested by the user:
 ## Build and verification
 
 - Run make check for a normal local check. It builds the static library and runs
-  the example plus file-I/O and lifecycle integration and fault tests; record
-  storage and recovery are not implemented or tested. Direct public-library
+  examples plus file-I/O, lifecycle, provisioning and batch tests, including a
+  deterministic volatile/persisted recovery model. Model tests do not prove
+  physical power-loss safety. Direct public-library
   builds must link exactly one native file backend.
 - Keep builds warning-free under the default strict C99 flags.
 - When changing compiler flags, run make clean first; Make does not track changes
@@ -80,7 +83,8 @@ Use simple, explicit C99 in the style requested by the user:
 - Add focused tests as real behavior appears. Storage changes need failure and
   recovery tests; do not add tests that merely duplicate trivial implementation.
 - GitHub Actions checks Linux and macOS with Make, Linux x86 32-bit file offsets, and
-  Windows Server 2022 x64 with Clang directly (public library and backend tests).
+  Windows Server 2022 x64 with Clang directly (public library, backend and batch
+  model tests; native batches verify unsupported provisioning).
   Report local results separately from CI and device results. Never claim unrun
   checks passed.
 - Do not add database features as part of unrelated setup or documentation work.
