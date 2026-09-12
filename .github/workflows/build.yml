@@ -20,7 +20,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Build and run example and file I/O tests
+      - name: Build and run example and storage tests
         run: make check
 
   linux_32:
@@ -42,7 +42,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force build | Out-Null
-          clang -std=c99 -Wall -Wextra -Wpedantic -Werror -I. timelite.c examples/basic.c -o build/basic.exe
+          clang -std=c99 -Wall -Wextra -Wpedantic -Werror -I. timelite.c file_io_windows.c examples/basic.c -o build/basic.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./build/basic.exe
           exit $LASTEXITCODE
@@ -59,4 +59,15 @@ jobs:
           clang --target=x86_64-pc-windows-msvc -std=c99 -Wall -Wextra -Wpedantic -Werror -DTIMELITE_IO_TEST -I. file_io_windows.c tests/file_io_windows_fault_test.c -o build/file_io_fault_test.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./build/file_io_fault_test.exe
+          exit $LASTEXITCODE
+      - name: Build and run lifecycle tests
+        shell: pwsh
+        run: |
+          clang --target=x86_64-pc-windows-msvc -std=c99 -Wall -Wextra -Wpedantic -Werror -I. timelite.c file_io_windows.c tests/lifecycle_test.c -o build/lifecycle_test.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./build/lifecycle_test.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          clang --target=x86_64-pc-windows-msvc -std=c99 -Wall -Wextra -Wpedantic -Werror -I. timelite.c tests/lifecycle_fault_test.c -o build/lifecycle_fault_test.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./build/lifecycle_fault_test.exe
           exit $LASTEXITCODE

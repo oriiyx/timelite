@@ -1,8 +1,8 @@
 # Timelite
 
 A small embedded time-series database project in C99. The current version is a
-library skeleton with an internal POSIX and Windows file-I/O layer. It builds, links into
-an example, and reports its version.
+library with database initialization, create/open/close, and header validation,
+backed by internal POSIX and Windows file I/O.
 It does not store or query data yet.
 
 The direction is a small C API, explicit memory ownership, no third-party
@@ -17,8 +17,8 @@ On Linux or macOS, install a C99 compiler, Make, and ar, then run:
 make check
 ```
 
-This creates build/libtimelite.a, build/basic, and two file-I/O test programs.
-It runs the example (shown below), temporary-file tests, and syscall fault tests:
+This creates build/libtimelite.a, build/basic, and file-I/O and database lifecycle test programs.
+It runs the example (shown below), temporary-file tests, and deterministic file-I/O and lifecycle fault tests:
 
 ```text
 Timelite 0.1.0-dev
@@ -31,7 +31,7 @@ You can also compile the library directly into an application:
 
 ```sh
 mkdir -p build
-cc -std=c99 -Wall -Wextra -Wpedantic -Werror -I. timelite.c examples/basic.c -o build/basic-direct
+cc -std=c99 -Wall -Wextra -Wpedantic -Werror -I. timelite.c file_io.c examples/basic.c -o build/basic-direct
 ./build/basic-direct
 ```
 
@@ -40,27 +40,81 @@ build tools), then run these commands in PowerShell:
 
 ```powershell
 New-Item -ItemType Directory -Force build
-clang -std=c99 -Wall -Wextra -Wpedantic -Werror -I. timelite.c examples/basic.c -o build/basic.exe
+clang -std=c99 -Wall -Wextra -Wpedantic -Werror -I. timelite.c file_io_windows.c examples/basic.c -o build/basic.exe
 ./build/basic.exe
 clang --target=x86_64-pc-windows-msvc -std=c99 -Wall -Wextra -Wpedantic -Werror -I. file_io_windows.c tests/file_io_test.c -o build/file_io_test.exe
 ./build/file_io_test.exe
 clang --target=x86_64-pc-windows-msvc -std=c99 -Wall -Wextra -Wpedantic -Werror -DTIMELITE_IO_TEST -I. file_io_windows.c tests/file_io_windows_fault_test.c -o build/file_io_fault_test.exe
 ./build/file_io_fault_test.exe
+clang --target=x86_64-pc-windows-msvc -std=c99 -Wall -Wextra -Wpedantic -Werror -I. timelite.c file_io_windows.c tests/lifecycle_test.c -o build/lifecycle_test.exe
+./build/lifecycle_test.exe
+clang --target=x86_64-pc-windows-msvc -std=c99 -Wall -Wextra -Wpedantic -Werror -I. timelite.c tests/lifecycle_fault_test.c -o build/lifecycle_fault_test.exe
+./build/lifecycle_fault_test.exe
 ```
 
 The Makefile uses Unix shell commands. GitHub Actions has Linux, macOS, and
-Windows public-library smoke checks, plus file-I/O tests on Linux/macOS, Windows
+Windows public-library smoke checks, plus file-I/O and lifecycle tests on Linux/macOS, Windows
 Server 2022 x64, and a Linux x86 32-bit job. Windows CI records OS and Clang
 versions and installed SDKs. Windows runtime/SDK validation is pending; local
 Windows checks so far are MinGW-w64 cross-compilation only. CI runs are separate
 from validation on the target devices.
+
+## Database lifecycle
+
+Initialize caller-owned storage before using it. Open handles have one owner and
+must not be copied or reinitialized. Calls must be serialized; there is no locking
+or concurrent/multi-process safety. Link the platform backend as shown above.
+
+```c
+#include <stdio.h>
+#include "timelite.h"
+
+int main(void)
+{
+    struct timelite_db db;
+    int error = timelite_init(&db);
+    if (error == 0)
+    {
+        error = timelite_open(&db, "sensors.tl", TIMELITE_OPEN_OR_CREATE);
+    }
+    if (error != 0)
+    {
+        fprintf(stderr, "open failed: %d\n", error);
+        return 1;
+    }
+    error = timelite_close(&db);
+    return error == 0 ? 0 : 1;
+}
+```
+
+`TIMELITE_OPEN_EXISTING` requires a valid existing database;
+`TIMELITE_CREATE_NEW` creates exclusively; `TIMELITE_OPEN_OR_CREATE` opens or
+exclusively creates when absent. Opening never truncates or repairs a file.
+The current database is exactly a 12-byte identifier/version header, with no
+records. Empty, short, malformed or v1 files with extra bytes return
+`TIMELITE_INVALID_DATABASE`; nonzero unknown versions return
+`TIMELITE_UNSUPPORTED_VERSION`. Other failures return positive errno values
+(including mapped Windows errors). Invalid arguments return EINVAL.
+
+Argument rejection leaves the handle unchanged. Other failed opens leave a closed
+reusable handle. Failed creation may leave an empty,
+partial or valid file; no cleanup deletes it. A valid file can reopen even after
+creation returned a sync error. Close consumes the handle even on failure; native
+resource release is then uncertain. Never retry close on the consumed resource.
+Creation writes and syncs the header but does not sync the parent directory;
+success does not promise durable creation under power loss. Reopen proves only
+visibility. See [feature 003](docs/feature/003-database-lifecycle.md) for exact
+validation order, ownership, format evolution and the proposed WAL contract.
+
+WAL is the intended default for future durable batch appends. WAL, record storage,
+recovery and checkpointing are specification only and are not implemented.
 
 ## Internal file I/O
 
 [file_io.h](file_io.h) defines the internal contract; it is deliberately absent
 from the public database header. The POSIX Make build includes file_io.c in the
 archive. Windows builds select file_io_windows.c instead; compile exactly one
-backend. The public-library direct build exercises only the version API.
+backend. The public library must link exactly one backend, even for the version example.
 
 The layer opens regular files read/write without truncating, creates exclusively
 with mode 0600 on POSIX (subject to umask), reads/writes at explicit offsets, obtains size,
@@ -108,7 +162,7 @@ are in [feature 001](docs/feature/001-file-io.md).
 - examples/basic.c: a small application that calls the library.
 - [AGENTS.md](AGENTS.md) and [CLAUDE.md](CLAUDE.md): coding-agent instructions.
 - [docs/feature/000-init.md](docs/feature/000-init.md): bootstrap scope and results.
-- [research/RESEARCH.md](research/RESEARCH.md): earlier feasibility research.
+- [docs/feature/003-database-lifecycle.md](docs/feature/003-database-lifecycle.md): lifecycle, header, failure analysis and future WAL contract.
 
 ## Contributions
 

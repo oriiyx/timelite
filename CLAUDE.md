@@ -14,8 +14,11 @@ In particular:
   change. Keep shared rules in AGENTS.md so these files do not drift apart.
 - Update the README when usage changes. Report only checks actually performed.
 
-The project has a library skeleton and internal Linux/macOS/Windows file I/O, not a
-working database. Keep the internal file layer separate from the public API and
+The project has database lifecycle/header validation and internal
+Linux/macOS/Windows file I/O; record storage, WAL and recovery remain future work.
+Keep the internal file layer separate from the public API and
 preserve the Windows library smoke build and backend tests. Windows x64 runtime
-validation is pending; use AGENTS.md for platform and ownership rules. Do not implement database storage
-formats or queries unless the task calls for them.
+validation is pending; use AGENTS.md for platform and ownership rules.
+Do not implement database storage
+formats or queries unless the task calls for them. Link exactly one backend in
+public-library builds; lifecycle creation does not promise power-loss durability.

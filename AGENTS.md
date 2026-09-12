@@ -3,11 +3,14 @@
 ## Project
 
 Timelite is a small embedded time-series database project written in C99.
-The current code is a buildable library skeleton with internal POSIX and Windows file I/O.
-Database storage formats and queries are future work. Read README.md and the
-relevant docs/feature notes before editing.
-The earlier research is in research/RESEARCH.md; it contains proposals, not all
-of which have been accepted. These instructions describe the current direction.
+The current code implements caller-owned database lifecycle and a 12-byte v1
+header, with internal POSIX and Windows file I/O. Record storage and queries are
+future work. WAL is the accepted default for future durable batch appends; WAL
+and recovery are currently specification only (feature 003). Creation syncs the
+file but does not promise durable directory entries or power-loss creation.
+Read README.md and the relevant docs/feature notes before editing. Earlier research
+was removed from main; historical proposals are not automatically accepted
+requirements. These instructions describe the current direction.
 
 Target devices include x86 and ARM32. Confirm the exact CPU, OS, and ABI before
 claiming support. A desktop build does not prove that the device build works.
@@ -68,8 +71,9 @@ Use simple, explicit C99 in the style requested by the user:
 ## Build and verification
 
 - Run make check for a normal local check. It builds the static library and runs
-  the example plus file-I/O integration and fault tests; it is not a database
-  test suite.
+  the example plus file-I/O and lifecycle integration and fault tests; record
+  storage and recovery are not implemented or tested. Direct public-library
+  builds must link exactly one native file backend.
 - Keep builds warning-free under the default strict C99 flags.
 - When changing compiler flags, run make clean first; Make does not track changes
   to command-line variables. CC and AR can be overridden on the make command line.
