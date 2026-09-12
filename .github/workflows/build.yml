@@ -34,8 +34,8 @@ jobs:
         run: make CC="gcc -m32" check
 
   windows:
-    name: C99 (Windows)
-    runs-on: windows-latest
+    name: C99 (Windows x64)
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
       - name: Build and run example
@@ -45,4 +45,18 @@ jobs:
           clang -std=c99 -Wall -Wextra -Wpedantic -Werror -I. timelite.c examples/basic.c -o build/basic.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./build/basic.exe
+          exit $LASTEXITCODE
+      - name: Build and run Windows file I/O tests
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, OSArchitecture
+          clang --version
+          Get-ChildItem 'C:/Program Files (x86)/Windows Kits/10/Include' | Select-Object Name
+          clang --target=x86_64-pc-windows-msvc -std=c99 -Wall -Wextra -Wpedantic -Werror -I. file_io_windows.c tests/file_io_test.c -o build/file_io_test.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./build/file_io_test.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          clang --target=x86_64-pc-windows-msvc -std=c99 -Wall -Wextra -Wpedantic -Werror -DTIMELITE_IO_TEST -I. file_io_windows.c tests/file_io_windows_fault_test.c -o build/file_io_fault_test.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./build/file_io_fault_test.exe
           exit $LASTEXITCODE
