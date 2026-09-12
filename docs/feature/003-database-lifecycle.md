@@ -91,6 +91,10 @@ must be resolved before claiming durable future appends to newly created files.
 
 ## WAL: intended next-feature contract, specification only
 
+Historical note (2026-09-12): feature 004 implemented the WAL append and
+recovery below; feature 006 ([006-checkpoint.md](006-checkpoint.md))
+implemented the checkpoint/install protocol and extends the interruption table.
+
 Accepted: WAL is the default and initially only future write mode. A WAL is a
 separate file that first records a complete batch before that batch is incorporated
 into main storage. The first append API should durably commit a whole batch before

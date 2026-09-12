@@ -5,8 +5,11 @@ Status: implemented and verified as recorded below; checkpointing deferred.
 Scheduling note (2026-09-12): this note originally assigned checkpointing to
 feature 005. Feature 005 became the repeatable testing suite
 ([005-testing-suite.md](005-testing-suite.md)). Checkpointing, main storage
-and WAL reclamation remain deferred with no number reserved. Mentions of
-"feature 005" below are historical and mean that later checkpointing feature.
+and WAL reclamation are implemented by feature 006
+([006-checkpoint.md](006-checkpoint.md)). Mentions of "feature 005" below are
+historical and mean feature 006. Feature 006 keeps this WAL frame format and
+the 32-byte pair headers; it extends the database body, so "DB must remain
+exactly 32 bytes" below describes the feature 004 layout, which 006 still reads.
 Prerequisite verified: freshly fetched origin/main e307196 includes feature 003.
 Branch: codex/004-durable-batch. Initial worktree and index were clean.
 

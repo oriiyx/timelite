@@ -7,8 +7,8 @@
    "coverage": "durable provisioning capability of the storage root"},
   {"name": "batches", "source": "examples/batches.c", "backend": "library",
    "platforms": ["posix", "windows"], "execution": "batch-example",
-   "coverage": "public batch example: create, append, close, reopen, read",
-   "stdout": "batch=1 series=7 us=1700000000000000 value=23500\n"},
+   "coverage": "public batch example: create, append, checkpoint, append, close, reopen, read",
+   "stdout": "batch=1 series=7 us=1700000000000000 value=23500\nbatch=2 series=7 us=1700000060000000 value=23625\n"},
   {"name": "file_io", "source": "tests/file_io_test.c", "backend": "library",
    "platforms": ["posix", "windows"],
    "coverage": "native file I/O including the required >4 GiB sparse group"},
@@ -27,8 +27,8 @@
    "platforms": ["posix", "windows"], "coverage": "v1 lifecycle with fake backend faults"},
   {"name": "batch", "source": "tests/batch_test.c", "backend": "library",
    "platforms": ["posix", "windows"], "execution": "batch",
-   "coverage": "native batch behavior, truncation prefixes and corruption"},
+   "coverage": "native batch behavior, checkpoint, capacity, truncation prefixes and corruption"},
   {"name": "batch_model", "source": "tests/batch_model_test.c", "backend": "fake",
    "platforms": ["posix", "windows"],
-   "coverage": "deterministic volatile/persisted model with exhaustive interruption boundaries"}
+   "coverage": "deterministic volatile/persisted model with exhaustive append and checkpoint interruption boundaries"}
 ]

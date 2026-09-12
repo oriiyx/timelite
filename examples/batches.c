@@ -6,7 +6,8 @@
 int main(int argc, char **argv)
 {
     struct timelite_batches db;
-    struct timelite_record input[] = {{7, UINT64_C(1700000000000000), 23500}};
+    struct timelite_record input[] = {{7, UINT64_C(1700000000000000), 23500},
+                                      {7, UINT64_C(1700000060000000), 23625}};
     struct timelite_record output[TIMELITE_MAX_RECORDS];
     unsigned char scratch[TIMELITE_BATCH_SCRATCH];
     uint64_t sequence;
@@ -27,10 +28,19 @@ int main(int argc, char **argv)
     }
     /* Application convention: series 7 measures thousandths of a degree C. */
     error = timelite_batches_append(&db, input, 1, scratch, sizeof(scratch), &sequence);
+    if (error == 0)
+    {
+        /* Install committed batches into the main file and reclaim the WAL. */
+        error = timelite_batches_checkpoint(&db, scratch, sizeof(scratch));
+    }
+    if (error == 0)
+    {
+        error = timelite_batches_append(&db, input + 1, 1, scratch, sizeof(scratch), &sequence);
+    }
     close_error = timelite_batches_close(&db);
     if (error != 0)
     {
-        fprintf(stderr, "append failed: %d; reopen and inspect before retrying\n", error);
+        fprintf(stderr, "append/checkpoint failed: %d; reopen and inspect before retrying\n", error);
         return 1;
     }
     if (close_error != 0)

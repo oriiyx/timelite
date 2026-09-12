@@ -8,8 +8,10 @@
 #include <stdio.h>
 #include <string.h>
 
+/* The database must hold one full-WAL checkpoint plus headers and a little more. */
+#define MODEL_DATABASE (67108864 + 65536)
 static unsigned char wal_bytes[67108864], wal_stable[67108864];
-static unsigned char database_bytes[64], database_stable[64];
+static unsigned char database_bytes[MODEL_DATABASE], database_stable[MODEL_DATABASE];
 struct model_file
 {
     unsigned char *bytes, *stable;
@@ -20,7 +22,7 @@ static struct model_file files[2];
 static int operation, fail_operation, fail_after, error_code;
 static size_t transfer_limit;
 static int read_failure, size_failure, close_failure, truncate_failure;
-static int identity_failure, provisioning_failure, create_failure, race;
+static int identity_failure, provisioning_failure, provision_error, create_failure, race;
 static int writes, truncates, provisions, closes;
 static unsigned char scratch[TIMELITE_BATCH_SCRATCH];
 static struct timelite_record input[64], output[64];
@@ -51,7 +53,7 @@ static void faults_clear(void)
     operation = fail_operation = fail_after = 0;
     read_failure = size_failure = close_failure = truncate_failure = 0;
     identity_failure = provisioning_failure = create_failure = race = 0;
-    error_code = EIO;
+    error_code = provision_error = EIO;
     transfer_limit = SIZE_MAX;
 }
 
@@ -172,6 +174,11 @@ int timelite_file_write(struct timelite_file *file, uint64_t offset,
     }
     *count = length < transfer_limit ? length : transfer_limit;
     assert(offset + *count <= (index ? sizeof(wal_bytes) : sizeof(database_bytes)));
+    if (offset > f->length)
+    {
+        /* Writing past EOF zero-fills the gap, as both native backends do. */
+        memset(f->bytes + f->length, 0, (size_t)offset - f->length);
+    }
     memcpy(f->bytes + (size_t)offset, buffer, *count);
     if (offset < f->dirty)
     {
@@ -202,7 +209,7 @@ int timelite_file_provision(struct timelite_file *file, const char *path)
     provisions++;
     if (provisioning_failure == index + 1)
     {
-        return EIO;
+        return provision_error;
     }
     persist(index);
     files[index].stable_exists = 1;
@@ -281,6 +288,23 @@ static void check_batches(struct timelite_batches *db, size_t expected)
     assert(timelite_batches_next(db, output, 64, &count, &sequence,
                                 scratch, sizeof(scratch)) == TIMELITE_END);
     assert(sequence == 99 && count == 99);
+}
+
+/* Counts batches of any size, asserting sequence continuity from 1. */
+static uint64_t count_batches(struct timelite_batches *db)
+{
+    size_t count;
+    uint64_t sequence, total = 0;
+    int error;
+    assert(timelite_batches_rewind(db) == 0);
+    while ((error = timelite_batches_next(db, output, 64, &count, &sequence,
+                                          scratch, sizeof(scratch))) == 0)
+    {
+        total++;
+        assert(sequence == total && count >= 1);
+    }
+    assert(error == TIMELITE_END);
+    return total;
 }
 
 static void interruptions(void)
@@ -505,24 +529,37 @@ static void creation(void)
 }
 
 /* Independent fixture CRC computation used to construct well-framed damage. */
-static void fixture_crc(unsigned char *bytes, size_t length)
+static uint32_t fixture_crc_value(const unsigned char *bytes, size_t length)
 {
     uint32_t crc = UINT32_MAX;
     size_t i;
     unsigned int j;
     for (i = 0; i < length; i++)
     {
-        TEST_CASE(__func__, i);
         crc ^= bytes[i];
         for (j = 0; j < 8; j++)
         {
             crc = (crc & 1) ? (crc >> 1) ^ UINT32_C(0xedb88320) : crc >> 1;
         }
     }
-    crc = ~crc;
+    return ~crc;
+}
+
+static void encode_fixture32(unsigned char *bytes, uint32_t value)
+{
+    size_t i;
     for (i = 0; i < 4; i++)
     {
-        TEST_CASE(__func__, i);
+        bytes[i] = (unsigned char)(value >> (i * 8));
+    }
+}
+
+static void fixture_crc(unsigned char *bytes, size_t length)
+{
+    uint32_t crc = fixture_crc_value(bytes, length);
+    size_t i;
+    for (i = 0; i < 4; i++)
+    {
         bytes[length + i] = (unsigned char)(crc >> (i * 8));
     }
 }
@@ -590,8 +627,10 @@ static void format_cases(void)
         assert(open_db(&db, TIMELITE_OPEN_EXISTING) == expected);
         assert(provisions == before && truncates == 0);
     }
-    /* All incomplete creation-header prefixes; artifacts remain untouched. */
-    for (prefix = 0; prefix < 32; prefix++)
+    /* All incomplete creation-image prefixes; artifacts remain untouched. A
+     * complete header with torn manifest slots is an empty database, but the
+     * empty WAL created just before fails validation; nothing is repaired. */
+    for (prefix = 0; prefix < 160; prefix++)
     {
         TEST_CASE(__func__, prefix);
         reset();
@@ -604,6 +643,395 @@ static void format_cases(void)
         assert(open_db(&db, TIMELITE_OPEN_OR_CREATE) == TIMELITE_INVALID_DATABASE);
         assert(writes == before);
     }
+}
+
+/* Golden install bytes generated independently with Python struct + zlib.crc32. */
+static const unsigned char golden_manifest0[] =
+    "\x54\x4c\x49\x4e\x53\x54\x41\x4c\x00\x00\x00\x00\x00\x00\x00\x00"
+    "\xa0\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+    "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+    "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x24\x40\xb6\x73";
+static const unsigned char golden_manifest1[] =
+    "\x54\x4c\x49\x4e\x53\x54\x41\x4c\x01\x00\x00\x00\x00\x00\x00\x00"
+    "\x14\x01\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00"
+    "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+    "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xf6\x94\xc8\x24";
+static const unsigned char golden_segment[] =
+    "\x54\x4c\x53\x45\x47\x4d\x4e\x54\x01\x00\x00\x00\x00\x00\x00\x00"
+    "\x01\x00\x00\x00\x00\x00\x00\x00\x54\x00\x00\x00\xd6\xa4\x16\x17";
+static const unsigned char zero_slot[64];
+
+typedef char golden_sizes_include_terminators[
+    sizeof(golden_manifest0) == 65 && sizeof(golden_manifest1) == 65 &&
+    sizeof(golden_segment) == 33 ? 1 : -1];
+
+static int checkpoint(struct timelite_batches *db)
+{
+    return timelite_batches_checkpoint(db, scratch, sizeof(scratch));
+}
+
+static void append_one(struct timelite_batches *db, uint64_t expected)
+{
+    uint64_t sequence = 99;
+    assert(timelite_batches_append(db, input, 1, scratch, sizeof(scratch), &sequence) == 0);
+    assert(sequence == expected);
+}
+
+static void checkpoint_basic(void)
+{
+    struct timelite_batches db;
+    uint64_t sequence = 99;
+    size_t count = 99;
+    int previous;
+    /* Creation writes the 160-byte image: header, generation 0, zero slot. */
+    new_db(&db);
+    assert(files[0].length == 160 && memcmp(database_bytes + 32, golden_manifest0, 64) == 0);
+    assert(memcmp(database_bytes + 96, zero_slot, 64) == 0);
+    /* Argument checks and the empty WAL have no effect. */
+    previous = writes;
+    assert(timelite_batches_checkpoint(&db, NULL, sizeof(scratch)) == EINVAL);
+    assert(timelite_batches_checkpoint(&db, scratch, 1343) == TIMELITE_BUFFER_TOO_SMALL);
+    assert(checkpoint(&db) == 0 && writes == previous && db.private_generation == 0);
+    assert(timelite_batches_checkpoint(NULL, scratch, sizeof(scratch)) == EINVAL);
+    /* One golden frame installed: segment at 160, frame at 192, manifest in slot 1. */
+    append_one(&db, 1);
+    assert(checkpoint(&db) == 0);
+    assert(files[0].length == 276 && files[1].length == 32 && files[1].stable_length == 32);
+    assert(memcmp(database_bytes + 160, golden_segment, 32) == 0);
+    assert(memcmp(database_bytes + 192, wal_stable + 32, 84) == 0);
+    assert(memcmp(database_bytes + 96, golden_manifest1, 64) == 0);
+    assert(memcmp(database_bytes + 32, golden_manifest0, 64) == 0);
+    assert(db.private_installed == 1 && db.private_generation == 1 && db.private_data_end == 276);
+    check_batches(&db, 1);
+    /* Sequences continue in the reclaimed WAL; reads combine both files. */
+    append_one(&db, 2);
+    append_one(&db, 3);
+    assert(files[1].length == 32 + 2 * 84 && wal_bytes[40] == 2);
+    check_batches(&db, 3);
+    /* The read position survives a checkpoint, including at END. */
+    assert(timelite_batches_rewind(&db) == 0);
+    assert(timelite_batches_next(&db, output, 64, &count, &sequence, scratch, sizeof(scratch)) == 0);
+    assert(sequence == 1);
+    assert(timelite_batches_next(&db, output, 64, &count, &sequence, scratch, sizeof(scratch)) == 0);
+    assert(sequence == 2);
+    assert(checkpoint(&db) == 0);
+    assert(db.private_generation == 2 && db.private_installed == 3 && files[1].length == 32);
+    assert(memcmp(database_bytes + 96, golden_manifest1, 64) == 0);
+    assert(database_bytes[40] == 2 && memcmp(database_bytes + 32, "TLINSTAL", 8) == 0);
+    assert(timelite_batches_next(&db, output, 64, &count, &sequence, scratch, sizeof(scratch)) == 0);
+    assert(sequence == 3);
+    assert(timelite_batches_next(&db, output, 64, &count, &sequence, scratch, sizeof(scratch)) == TIMELITE_END);
+    append_one(&db, 4);
+    assert(timelite_batches_next(&db, output, 64, &count, &sequence, scratch, sizeof(scratch)) == 0);
+    assert(sequence == 4);
+    assert(checkpoint(&db) == 0);
+    assert(timelite_batches_next(&db, output, 64, &count, &sequence, scratch, sizeof(scratch)) == TIMELITE_END);
+    /* Small output leaves the position at a segment boundary unchanged. */
+    assert(timelite_batches_rewind(&db) == 0);
+    assert(timelite_batches_next(&db, output, 0, &count, &sequence, scratch, sizeof(scratch)) == TIMELITE_BUFFER_TOO_SMALL);
+    check_batches(&db, 4);
+    /* Crash without close, reopen: three segments and an empty WAL. */
+    crash();
+    assert(timelite_batches_init(&db) == 0);
+    assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
+    assert(db.private_generation == 3 && db.private_installed == 4 && db.private_end == 32);
+    check_batches(&db, 4);
+    /* Feature 004 recovery still applies to appends after reclaim. */
+    append_one(&db, 5);
+    operation = 0;
+    fail_operation = 3;
+    assert(timelite_batches_append(&db, input, 1, scratch, sizeof(scratch), &sequence) == EIO);
+    crash();
+    assert(timelite_batches_init(&db) == 0);
+    assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
+    assert(files[1].length == 32 + 84);
+    check_batches(&db, 5);
+    append_one(&db, 6);
+    check_batches(&db, 6);
+    assert(timelite_batches_close(&db) == 0);
+    /* Windows contract: provisioning ENOTSUP fails open, checkpoint is EBADF. */
+    reset();
+    assert(timelite_batches_init(&db) == 0);
+    provisioning_failure = 1;
+    provision_error = ENOTSUP;
+    assert(open_db(&db, TIMELITE_CREATE_NEW) == ENOTSUP);
+    previous = writes;
+    assert(checkpoint(&db) == EBADF && writes == previous);
+    assert(!files[0].owned && !files[1].owned);
+}
+
+/* Every write, sync and truncate boundary of a checkpoint, before and after
+ * its effect, optionally with all unsynced bytes surviving the crash. The
+ * first loop starts from a database with one installed segment so a later
+ * failure can never invalidate it; the second starts from the feature 004
+ * 32-byte layout and covers the slot upgrade. */
+static void checkpoint_boundaries(void)
+{
+    struct timelite_batches db;
+    uint64_t sequence = 99;
+    int legacy, boundary, after, survive, durable, operations;
+    for (legacy = 0; legacy <= 1; legacy++)
+    {
+        /* Regular: header, 2 frames, sync, manifest, sync, [truncate], sync.
+         * Legacy: upgrade write and sync, header, 3 frames, sync, manifest,
+         * sync, [truncate], sync. Boundaries past the count are truncate
+         * failures before and after effect. */
+        operations = legacy ? 10 : 7;
+        for (boundary = 1; boundary <= operations + 2; boundary++)
+        {
+            for (after = 0; after <= 1; after++)
+            {
+                for (survive = 0; survive <= 1; survive++)
+                {
+                    TEST_CASE(legacy ? "legacy checkpoint boundary" : "checkpoint boundary",
+                              boundary * 100 + after * 10 + survive);
+                    new_db(&db);
+                    append_one(&db, 1);
+                    if (legacy)
+                    {
+                        assert(timelite_batches_close(&db) == 0);
+                        files[0].length = 32;
+                        persist(0);
+                        assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
+                        assert(db.private_legacy == 1 && db.private_data_end == 160);
+                    }
+                    else
+                    {
+                        assert(checkpoint(&db) == 0);
+                    }
+                    append_one(&db, 2);
+                    append_one(&db, 3);
+                    operation = 0;
+                    if (boundary <= operations)
+                    {
+                        fail_operation = boundary;
+                        fail_after = after;
+                    }
+                    else
+                    {
+                        truncate_failure = boundary - operations;
+                    }
+                    assert(checkpoint(&db) == EIO);
+                    assert(timelite_batches_append(&db, input, 1, scratch, sizeof(scratch),
+                                                  &sequence) == TIMELITE_RECOVERY_REQUIRED);
+                    assert(checkpoint(&db) == TIMELITE_RECOVERY_REQUIRED);
+                    assert(timelite_batches_rewind(&db) == TIMELITE_RECOVERY_REQUIRED);
+                    if (survive)
+                    {
+                        persist(0);
+                        persist(1);
+                    }
+                    crash();
+                    assert(timelite_batches_init(&db) == 0);
+                    assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
+                    /* The install is durable exactly when its manifest reached
+                     * stable storage; the WAL is then finished off at open. */
+                    durable = boundary > operations - 1 ||
+                              (boundary == operations - 1 && (after || survive)) ||
+                              (boundary == operations - 2 && after && survive);
+                    if (durable)
+                    {
+                        assert(db.private_installed == 3 && files[1].length == 32);
+                        assert(db.private_generation == (legacy ? 1 : 2));
+                    }
+                    else
+                    {
+                        assert(db.private_installed == (legacy ? 0 : 1));
+                        assert(files[1].length == 32 + 84 * (legacy ? 3 : 2));
+                        assert(db.private_generation == (legacy ? 0 : 1));
+                    }
+                    check_batches(&db, 3);
+                    append_one(&db, 4);
+                    check_batches(&db, 4);
+                    assert(checkpoint(&db) == 0);
+                    assert(db.private_legacy == 0 && files[1].length == 32);
+                    assert(db.private_installed == 4);
+                    check_batches(&db, 4);
+                    crash();
+                    assert(timelite_batches_init(&db) == 0);
+                    assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
+                    check_batches(&db, 4);
+                    assert(timelite_batches_close(&db) == 0);
+                }
+            }
+        }
+    }
+}
+
+/* Builds a stale WAL: two committed frames installed, reclaim interrupted. */
+static void stale_wal(struct timelite_batches *db)
+{
+    new_db(db);
+    append_one(db, 1);
+    append_one(db, 2);
+    truncate_failure = 1;
+    assert(checkpoint(db) == EIO);
+    crash();
+    assert(files[1].length == 200 && files[0].length == 160 + 32 + 168);
+    assert(timelite_batches_init(db) == 0);
+}
+
+static void checkpoint_format(void)
+{
+    struct timelite_batches db;
+    uint64_t sequence = 99;
+    size_t count = 99;
+    int i, before, before_truncates, error;
+    /* Damage after one or two checkpoints. Cases 0..5 must fail closed; 6
+     * (older manifest damaged) opens on the newest manifest. */
+    for (i = 0; i <= 6; i++)
+    {
+        TEST_CASE(__func__, i);
+        new_db(&db);
+        append_one(&db, 1);
+        assert(checkpoint(&db) == 0);
+        if (i == 6)
+        {
+            append_one(&db, 2);
+            assert(checkpoint(&db) == 0);
+        }
+        assert(timelite_batches_close(&db) == 0);
+        if (i == 0)
+        {
+            database_bytes[100] ^= 1; /* Newest manifest damaged after reclaim. */
+        }
+        if (i == 1)
+        {
+            database_bytes[130] = 1; /* Nonzero reserved byte with valid CRC. */
+            fixture_crc(database_bytes + 96, 60);
+        }
+        if (i == 2)
+        {
+            database_bytes[112] = 0x15; /* data_end 277 beyond the 276-byte file. */
+            fixture_crc(database_bytes + 96, 60);
+        }
+        if (i == 3)
+        {
+            memcpy(database_bytes + 32, database_bytes + 96, 64); /* Generation 1 in slot 0. */
+            memset(database_bytes + 96, 0, 64);
+        }
+        if (i == 4)
+        {
+            database_bytes[168] = 2; /* Segment first sequence with valid CRC. */
+            fixture_crc(database_bytes + 160, 28);
+        }
+        if (i == 5)
+        {
+            database_bytes[184] = 85; /* Segment body length with valid CRC. */
+            fixture_crc(database_bytes + 160, 28);
+        }
+        if (i == 6)
+        {
+            database_bytes[100] ^= 1; /* Older manifest (generation 1) damaged. */
+        }
+        before = writes;
+        before_truncates = truncates;
+        error = open_db(&db, TIMELITE_OPEN_EXISTING);
+        assert(error == (i == 6 ? 0 : TIMELITE_INVALID_DATABASE));
+        assert(writes == before && truncates == before_truncates);
+        if (i == 6)
+        {
+            check_batches(&db, 2);
+            assert(timelite_batches_close(&db) == 0);
+        }
+    }
+    /* Newest manifest damaged after appends resumed: sequence gap fails closed. */
+    new_db(&db);
+    append_one(&db, 1);
+    assert(checkpoint(&db) == 0);
+    append_one(&db, 2);
+    assert(timelite_batches_close(&db) == 0);
+    database_bytes[100] ^= 1;
+    assert(open_db(&db, TIMELITE_OPEN_EXISTING) == TIMELITE_INVALID_DATABASE);
+    /* Every single-bit flip in the segment header or manifest fails closed;
+     * a flip inside the installed frame opens and then fails at that read. */
+    for (i = 96; i < 276; i++)
+    {
+        TEST_CASE("installed byte flip", i);
+        new_db(&db);
+        append_one(&db, 1);
+        assert(checkpoint(&db) == 0);
+        append_one(&db, 2);
+        assert(timelite_batches_close(&db) == 0);
+        database_bytes[i] ^= 1;
+        error = open_db(&db, TIMELITE_OPEN_EXISTING);
+        if (i < 192)
+        {
+            assert(error == TIMELITE_INVALID_DATABASE);
+            continue;
+        }
+        assert(error == 0);
+        output[0].series = 1234;
+        assert(timelite_batches_next(&db, output, 64, &count, &sequence, scratch,
+                                    sizeof(scratch)) == TIMELITE_INVALID_DATABASE);
+        assert(timelite_batches_next(&db, output, 64, &count, &sequence, scratch,
+                                    sizeof(scratch)) == TIMELITE_INVALID_DATABASE);
+        assert(count == 99 && output[0].series == 1234 && db.private_cursor == 160);
+        assert(timelite_batches_close(&db) == 0);
+    }
+    /* Stale WAL: finished at open; damaged or extended stale WALs fail closed. */
+    stale_wal(&db);
+    before_truncates = truncates;
+    assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
+    assert(truncates == before_truncates + 1 && files[1].length == 32);
+    assert(files[1].stable_length == 32);
+    assert(db.private_installed == 2 && db.private_sequence == 2);
+    check_batches(&db, 2);
+    append_one(&db, 3);
+    check_batches(&db, 3);
+    assert(timelite_batches_close(&db) == 0);
+    stale_wal(&db);
+    wal_bytes[100] ^= 1;
+    persist(1);
+    before_truncates = truncates;
+    assert(open_db(&db, TIMELITE_OPEN_EXISTING) == TIMELITE_INVALID_DATABASE);
+    assert(truncates == before_truncates);
+    stale_wal(&db);
+    memcpy(wal_bytes + 200, wal_bytes + 116, 84); /* Frame 3 follows installed 1..2. */
+    wal_bytes[208] = 3;
+    fixture_crc(wal_bytes + 200, 28);
+    wal_bytes[260] = 3;
+    encode_fixture32(wal_bytes + 276, fixture_crc_value(wal_bytes + 200, 52));
+    fixture_crc(wal_bytes + 252, 28);
+    files[1].length = 284;
+    persist(1);
+    before_truncates = truncates;
+    assert(open_db(&db, TIMELITE_OPEN_EXISTING) == TIMELITE_INVALID_DATABASE);
+    assert(truncates == before_truncates);
+    /* Stale WAL with an incomplete tail is impossible under the protocol. */
+    stale_wal(&db);
+    files[1].length = 190;
+    persist(1);
+    before_truncates = truncates;
+    assert(open_db(&db, TIMELITE_OPEN_EXISTING) == TIMELITE_INVALID_DATABASE);
+    assert(truncates == before_truncates);
+    /* Database cut below data_end with an empty WAL: orphan bytes without
+     * uninstalled WAL frames fail closed (a cut to exactly 160 or below is
+     * indistinguishable from a fresh database and is outside the model). */
+    for (i = 161; i < 276; i++)
+    {
+        TEST_CASE("database cut", i);
+        new_db(&db);
+        append_one(&db, 1);
+        assert(checkpoint(&db) == 0);
+        assert(timelite_batches_close(&db) == 0);
+        files[0].length = (size_t)i;
+        persist(0);
+        before = writes;
+        assert(open_db(&db, TIMELITE_OPEN_EXISTING) == TIMELITE_INVALID_DATABASE);
+        assert(writes == before);
+    }
+    /* Torn creation image: header complete, slots partial, then a WAL exists. */
+    new_db(&db);
+    assert(timelite_batches_close(&db) == 0);
+    files[0].length = 100;
+    persist(0);
+    assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
+    assert(db.private_legacy == 0 && db.private_generation == 0);
+    append_one(&db, 1);
+    assert(checkpoint(&db) == 0);
+    check_batches(&db, 1);
+    assert(timelite_batches_close(&db) == 0);
 }
 
 static void capacity(void)
@@ -634,6 +1062,21 @@ static void capacity(void)
     crash();
     assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
     assert(db.private_sequence == expected);
+    /* Checkpoint the full WAL, then append past the old 64 MiB limit. */
+    assert(timelite_batches_checkpoint(&db, scratch, sizeof(scratch)) == 0);
+    assert(files[1].length == 32 && files[0].length == 160 + saved_length);
+    assert(db.private_installed == expected && db.private_generation == 1);
+    assert(memcmp(database_bytes + 192, wal_stable + 32, saved_length - 32) == 0);
+    assert(timelite_batches_append(&db, input, 64, scratch, sizeof(scratch), &sequence) == 0);
+    assert(sequence == expected + 1);
+    assert(count_batches(&db) == expected + 1);
+    crash();
+    assert(timelite_batches_init(&db) == 0);
+    assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
+    assert(count_batches(&db) == expected + 1);
+    assert(timelite_batches_checkpoint(&db, scratch, sizeof(scratch)) == 0);
+    assert(db.private_generation == 2 && files[1].length == 32);
+    assert(count_batches(&db) == expected + 1);
     assert(timelite_batches_close(&db) == 0);
 }
 
@@ -646,7 +1089,10 @@ int main(void)
     failures();
     creation();
     format_cases();
+    checkpoint_basic();
+    checkpoint_boundaries();
+    checkpoint_format();
     capacity();
-    puts("batch persisted/volatile model, failures, recovery and 64 MiB capacity: passed");
+    puts("batch persisted/volatile model, checkpoint boundaries, recovery and 64 MiB capacity: passed");
     return 0;
 }

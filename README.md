@@ -1,11 +1,13 @@
 # Timelite
 
 A small embedded time-series database project in C99. The current version is a
-library with durable sensor batch append, recovery, and sequential reading from a
-separate WAL on supported local POSIX filesystems. The original v1 lifecycle API
-remains available. Windows retains lifecycle and file I/O; durable batch
-provisioning currently returns `ENOTSUP`. Checkpointing remains deferred to a later
-feature; feature 005 is the repeatable testing suite described under Testing.
+library with durable sensor batch append, recovery, sequential reading and
+explicit checkpointing: committed WAL batches are installed into the main
+database file as immutable segments and the WAL is reclaimed only after that
+install is durable, on supported local POSIX filesystems. The original v1
+lifecycle API remains available. Windows retains lifecycle and file I/O; durable
+batch provisioning currently returns `ENOTSUP`. Feature 005 is the repeatable
+testing suite described under Testing; feature 006 is checkpointing.
 
 The direction is a small C API, explicit memory ownership, no third-party
 dependencies, and a narrow scope for sensor history. Target devices include x86
@@ -21,7 +23,7 @@ make check
 ```
 
 This builds build/libtimelite.a, build/basic and build/batches with Make, then
-runs the native test profile through the runner (see Testing). The example prints:
+runs the native test profile through the runner (see Testing). The basic example prints:
 
 ```text
 Timelite 0.1.0-dev
@@ -122,9 +124,10 @@ passes only when at least one test passed and every other row is a PASS or an
 optional SKIP. Required skips, BLOCKED, NOT RUN, timeouts, missing tools, an
 empty selection and a source change during the run all fail the run. Test
 programs use fixed exit codes: 0 pass, 77 durable provisioning unsupported on
-the storage, 78 required group not run (the >4 GiB sparse group); anything else
-is a failure. Failures name the test case and the injected boundary, not only
-an assertion line.
+the storage, 78 required group not run (the >4 GiB sparse group of `file_io`
+and the 1 GiB sparse capacity fixture of `batch`); anything else is a failure.
+Failures name the test case and the injected boundary, not only an assertion
+line.
 
 Coverage is separated explicitly. `storage_probe` reports whether the run's
 storage supports durable provisioning. On supported storage the `batch` test is
@@ -186,9 +189,11 @@ or runner, not in a chat transcript.
 The complete example below is also [examples/batches.c](examples/batches.c).
 Build it with `make`, then run `./build/batches DATABASE WAL` using two unused
 paths in an existing, stable, already-durable local directory. It creates a pair,
-appends one batch, closes, reopens, and reads the committed batch. It leaves both
-files in place. On unsupported provisioning, including Windows, creation returns
-an error; partial artifacts may remain and are never automatically deleted.
+appends one batch, checkpoints it into the main file, appends a second batch
+that stays in the WAL, closes, reopens, and reads both committed batches in
+order. It leaves both files in place. On unsupported provisioning, including
+Windows, creation returns an error; partial artifacts may remain and are never
+automatically deleted.
 
 ```c
 #include "timelite.h"
@@ -199,7 +204,8 @@ an error; partial artifacts may remain and are never automatically deleted.
 int main(int argc, char **argv)
 {
     struct timelite_batches db;
-    struct timelite_record input[] = {{7, UINT64_C(1700000000000000), 23500}};
+    struct timelite_record input[] = {{7, UINT64_C(1700000000000000), 23500},
+                                      {7, UINT64_C(1700000060000000), 23625}};
     struct timelite_record output[TIMELITE_MAX_RECORDS];
     unsigned char scratch[TIMELITE_BATCH_SCRATCH];
     uint64_t sequence;
@@ -220,10 +226,19 @@ int main(int argc, char **argv)
     }
     /* Application convention: series 7 measures thousandths of a degree C. */
     error = timelite_batches_append(&db, input, 1, scratch, sizeof(scratch), &sequence);
+    if (error == 0)
+    {
+        /* Install committed batches into the main file and reclaim the WAL. */
+        error = timelite_batches_checkpoint(&db, scratch, sizeof(scratch));
+    }
+    if (error == 0)
+    {
+        error = timelite_batches_append(&db, input + 1, 1, scratch, sizeof(scratch), &sequence);
+    }
     close_error = timelite_batches_close(&db);
     if (error != 0)
     {
-        fprintf(stderr, "append failed: %d; reopen and inspect before retrying\n", error);
+        fprintf(stderr, "append/checkpoint failed: %d; reopen and inspect before retrying\n", error);
         return 1;
     }
     if (close_error != 0)
@@ -276,12 +291,59 @@ open handle or externally modify, rename, replace or delete its files/directorie
 
 The WAL limit is 64 MiB including its 32-byte header. A batch occupies
 64 + 20 × record count bytes (84..1344). `TIMELITE_WAL_FULL` rejects a batch
-before writes; committed data is never overwritten or reclaimed. A later
-checkpointing feature must move batches into main storage before reclaiming WAL
-capacity. This feature
-provides no rotation, retention, segments, indexes or queries beyond batch reading.
+before writes; committed WAL data is never overwritten and is reclaimed only by
+checkpoint. There is no rotation, retention, compaction, index or query beyond
+batch reading.
 
-`timelite_batches_next` returns only whole validated batches. `TIMELITE_END`
+### Checkpoint
+
+`timelite_batches_checkpoint(&db, scratch, size)` installs every batch
+committed to the WAL into the main database file as one immutable segment,
+durably switches a two-slot generation manifest to reference it, and only then
+truncates the WAL to its header. It is manual: append never checkpoints, so
+call it when `TIMELITE_WAL_FULL` appears or on your own schedule. An empty WAL
+returns 0 without I/O. Success promises that all batches committed before the
+call are installed and durable under the storage contract below, the WAL is
+empty, sequence numbers continue unchanged, and the read cursor keeps its
+logical position (including `TIMELITE_END`).
+
+Argument errors (`EINVAL`, `TIMELITE_BUFFER_TOO_SMALL`) and
+`TIMELITE_DATABASE_FULL` have no effect and leave the handle usable. Any write,
+sync, truncate or re-validation error after that poisons the handle with
+`TIMELITE_RECOVERY_REQUIRED` until close and reopen, like a failed append. A
+failed or interrupted checkpoint never loses a committed batch: the WAL is cut
+only after the new manifest is synced, an interrupted install leaves ignored
+orphan bytes that the next checkpoint overwrites, and an interrupted truncation
+leaves a stale WAL that reopen recognises (its first sequence is already
+installed) and finishes truncating. Reopen fails closed with
+`TIMELITE_INVALID_DATABASE` on a damaged manifest or segment header, on orphan
+bytes without matching WAL frames (the signature of a lost newest manifest or
+an externally cut file), on a stale WAL that is damaged or extends past the
+installed sequence, and on an installed frame that is damaged, at the read that
+reaches it (cursor unchanged). Reading walks installed segments first, then the
+WAL, validating each frame with the same checksums.
+
+The main file layout is: 32-byte pair header, two 64-byte manifest slots,
+segments from offset 160 (32-byte header plus the WAL frames verbatim). Each
+checkpoint adds one segment; open reads one header per segment, so checkpoint
+many batches at a time rather than one. `TIMELITE_DATABASE_CAPACITY` (1 GiB)
+bounds the main file; when the next segment would not fit, checkpoint returns
+`TIMELITE_DATABASE_FULL` before any effect and appends continue until the WAL
+is full, after which the pair is read-only until a future retention feature.
+A database created by feature 004 (exactly 32 bytes) opens unchanged and gains
+its manifest slots on its first checkpoint; the feature 004 library fails closed
+without writing on a checkpointed pair. Externally cutting the main file to
+exactly its empty size (160 bytes or less) is indistinguishable from a fresh
+database and outside the recovery model, as is external WAL truncation.
+
+What remains unproven: physical power cuts, device firmware behaviour, and
+target hardware. The interruption model, the native tests and the container and
+cross builds are separate evidence; see
+[feature 006](docs/feature/006-checkpoint.md) for the exact byte layouts,
+sync order, interruption table and results.
+
+`timelite_batches_next` returns only whole validated batches, installed
+segments first and then the WAL, in sequence order. `TIMELITE_END`
 means the cursor reached currently committed data; later serialized appends are
 visible at that cursor. `timelite_batches_rewind` restarts at sequence 1.
 `TIMELITE_BUFFER_TOO_SMALL` leaves cursor and output unchanged, allowing retry
@@ -291,8 +353,8 @@ next sequence, starting at 1. Reopen derives that sequence from validated commit
 
 Positive returns are errno values; negative returns are Timelite results declared
 in [timelite.h](timelite.h). Argument/buffer/capacity rejection leaves the handle
-usable. Any append write or sync error poisons reads and appends with
-`TIMELITE_RECOVERY_REQUIRED` until close/reopen. The failed batch may still be
+usable. Any append or checkpoint write or sync error poisons reads, appends and
+checkpoints with `TIMELITE_RECOVERY_REQUIRED` until close/reopen. The failed batch may still be
 committed: enumerate sequences and contents after reopen before deciding to retry.
 Identical contents cannot distinguish independent identical readings from a retry;
 there is no exactly-once promise. Close consumes both resources even on failure;
@@ -333,8 +395,10 @@ partial. Arbitrary external truncation is outside the recovery model: it cannot
 be distinguished from an interrupted uncommitted suffix. Checksums detect
 accidental damage with finite collision probability, not malicious edits.
 
-See [feature 004](docs/feature/004-durable-batch.md) for exact encoding, failure
-boundaries, official durability sources, and separate verification results.
+See [feature 004](docs/feature/004-durable-batch.md) for exact WAL encoding,
+failure boundaries, official durability sources, and separate verification
+results, and [feature 006](docs/feature/006-checkpoint.md) for the checkpoint
+layout and protocol.
 
 ## Database lifecycle
 
@@ -383,8 +447,8 @@ success does not promise durable creation under power loss. Reopen proves only
 visibility. See [feature 003](docs/feature/003-database-lifecycle.md) for exact
 validation order, ownership, format evolution and the proposed WAL contract.
 
-The separate v2 batch API above implements WAL append and recovery. Checkpointing
-and main-storage segments remain deferred to a later feature.
+The separate v2 batch API above implements WAL append, recovery, checkpointing
+into main-storage segments and WAL reclamation.
 
 ## Internal file I/O
 
@@ -441,11 +505,12 @@ are in [feature 001](docs/feature/001-file-io.md).
 - tools/test.py, tools/inventory.json, tools/test_runner.py, tools/docker/:
   test runner, shared inventory, runner self-tests and the toolchain image.
 - examples/basic.c: a small application that calls the library.
-- examples/batches.c: complete v2 create/append/read/reopen application.
+- examples/batches.c: complete v2 create/append/checkpoint/read/reopen application.
 - [AGENTS.md](AGENTS.md) and [CLAUDE.md](CLAUDE.md): coding-agent instructions.
 - [docs/feature/000-init.md](docs/feature/000-init.md): bootstrap scope and results.
 - [docs/feature/003-database-lifecycle.md](docs/feature/003-database-lifecycle.md): lifecycle, header, failure analysis and future WAL contract.
 - [docs/feature/005-testing-suite.md](docs/feature/005-testing-suite.md): testing suite design, verification results and gaps.
+- [docs/feature/006-checkpoint.md](docs/feature/006-checkpoint.md): checkpoint layout, protocol, interruption table and results.
 
 ## Contributions
 

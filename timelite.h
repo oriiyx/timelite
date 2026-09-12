@@ -64,11 +64,14 @@ const char *timelite_version(void);
 #define TIMELITE_MAX_RECORDS 64u
 #define TIMELITE_BATCH_SCRATCH 1344u
 #define TIMELITE_WAL_CAPACITY UINT64_C(67108864)
+/* Main database file limit including headers; checkpoint refuses to grow past it. */
+#define TIMELITE_DATABASE_CAPACITY UINT64_C(1073741824)
 #define TIMELITE_END (-3)
 #define TIMELITE_BUFFER_TOO_SMALL (-4)
 #define TIMELITE_RECOVERY_REQUIRED (-5)
 #define TIMELITE_WAL_FULL (-6)
 #define TIMELITE_PAIR_MISMATCH (-7)
+#define TIMELITE_DATABASE_FULL (-8)
 
 struct timelite_record
 {
@@ -90,6 +93,12 @@ struct timelite_batches
     uint64_t private_sequence;
     uint64_t private_cursor;
     uint64_t private_read_sequence;
+    uint64_t private_data_end;
+    uint64_t private_installed;
+    uint64_t private_generation;
+    uint64_t private_segment_end;
+    int private_in_wal;
+    int private_legacy;
     int private_failed;
 };
 
@@ -110,12 +119,29 @@ int timelite_batches_open(struct timelite_batches *db, const char *database_path
  * Sequence output written only on durable success. Argument/capacity errors are
  * harmless; any write/sync failure requires close/reopen before reads or appends.
  * Failed append may commit; enumerate after reopen to reconcile, no exactly-once
- * retry guarantee. WAL capacity is fixed and cannot be reclaimed until 005. */
+ * retry guarantee. WAL capacity is fixed; only checkpoint reclaims it. */
 int timelite_batches_append(struct timelite_batches *db,
                             const struct timelite_record *records, size_t count,
                             void *scratch, size_t scratch_size, uint64_t *sequence);
+/* Installs every committed WAL batch into the main file as one immutable
+ * segment, durably switches the install manifest, then truncates the WAL.
+ * Empty WAL: returns 0 without I/O. Manual only; append never checkpoints.
+ * Argument/scratch errors and DATABASE_FULL (main file would exceed
+ * DATABASE_CAPACITY) have no effect and leave the handle usable. Any write,
+ * sync, truncate or re-validation error after that poisons the handle like a
+ * failed append: RECOVERY_REQUIRED until close/reopen. Reopen never loses a
+ * committed batch: the WAL is truncated only after the manifest is durable, and
+ * recovery finishes an interrupted truncation. Success promises all batches
+ * committed before the call are installed and durable under the feature 004
+ * storage contract, the WAL is empty, sequences continue unchanged and the
+ * read position is preserved. Windows cannot open a pair (ENOTSUP), so this
+ * returns EBADF there on the closed handle; there is no weaker fallback. */
+int timelite_batches_checkpoint(struct timelite_batches *db,
+                                void *scratch, size_t scratch_size);
 /* Validated output only on success. All outputs/cursor unchanged on error or END.
  * BUFFER_TOO_SMALL allows retry at same cursor. Scratch >= BATCH_SCRATCH required.
+ * Returns installed batches, then WAL batches, in sequence order. A damaged
+ * installed frame returns INVALID_DATABASE at that position without skipping.
  * At END, later serialized appends become visible. Rewind returns to batch 1. */
 int timelite_batches_next(struct timelite_batches *db,
                           struct timelite_record *records, size_t capacity,

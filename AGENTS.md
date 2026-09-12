@@ -4,9 +4,13 @@
 
 Timelite is a small embedded time-series database project written in C99.
 The code implements v1 lifecycle plus a separate v2 durable sensor batch API,
-with a paired WAL, recovery and sequential batch reading. The WAL is capped at
-64 MiB; checkpointing/main storage/reclamation remain deferred to a later feature
-with no number reserved (feature 005 became the repeatable testing suite).
+with a paired WAL, recovery, sequential batch reading and explicit checkpointing
+(feature 006): committed WAL batches are installed into the main database file
+as immutable segments behind a two-slot generation manifest, and the WAL is
+truncated only after that install is durable. The WAL is capped at 64 MiB and
+the main file at 1 GiB; checkpoint is manual and never automatic. Feature 005 is
+the repeatable testing suite. Retention, compaction, indexes and queries remain
+deferred.
 Batch operations use caller-owned scratch, integer records and serialized ownership.
 Durable provisioning is implemented for selected local Linux/macOS filesystems;
 Windows batch provisioning explicitly returns ENOTSUP. v1 creation retains its
@@ -45,6 +49,11 @@ Use simple, explicit C99 in the style requested by the user:
   boundary when storage is introduced; do not build unused platform layers now.
 - Use fixed-width fields and explicit byte encoding for persistent data. Never
   write native structs directly to disk. Check lengths, overflow, and errors.
+- Never assume an in-place overwrite is atomic. Install new persistent state
+  by writing and syncing it in an unreferenced place first, then switching a
+  checksummed generation record that lives in the slot not currently in use.
+  Reclaim redundant data (for example WAL frames) only after that switch is
+  synced, and make recovery finish any interrupted reclaim.
 - Do not claim crash safety, durability, or thread safety without a defined
   contract and tests. A completed write is not necessarily a durable commit.
 
@@ -87,7 +96,8 @@ Use simple, explicit C99 in the style requested by the user:
   Makefile or workflows.
 - Test programs return 0 on success, 77 when durable provisioning is
   unsupported on the storage (the expected contract on Windows) and 78 when a
-  required group could not run. Any other exit is a failure. Use test_assert.h
+  required group could not run (the >4 GiB sparse file group and the 1 GiB
+  sparse capacity fixture). Any other exit is a failure. Use test_assert.h
   (never <assert.h>) so checks survive NDEBUG and name the case and boundary.
 - Every run gets a unique directory under build/test-runs with a source
   snapshot, per-command logs, report.json and junit.xml. Results are marked

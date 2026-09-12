@@ -21,12 +21,13 @@ In particular:
   changes, failures, or a concrete coverage gap (see AGENTS.md).
 
 The project has v1 lifecycle and a separate v2 sensor batch API with durable WAL
-append, recovery and sequential reading. Checkpointing and WAL reclamation remain
-deferred to a later feature with no number reserved; feature 005 is the
-repeatable testing suite. Keep the internal native file layer separate from
-public APIs.
+append, recovery, sequential reading over installed segments plus the WAL, and
+manual checkpointing with safe WAL reclamation (feature 006: segments behind a
+two-slot generation manifest, WAL truncated only after the install is durable).
+Feature 005 is the repeatable testing suite. Keep the internal native file layer
+separate from public APIs.
 Preserve Windows library/backend tests and the batch model; Windows namespace
 provisioning is unsupported and must return ENOTSUP without a weaker fallback.
-Use AGENTS.md and feature 004 for the qualified durability, memory and ownership
-contracts. Link exactly one native backend. Report physical-device, Windows
+Use AGENTS.md, feature 004 and feature 006 for the qualified durability, memory,
+ownership and checkpoint contracts. Never treat an in-place overwrite as atomic. Link exactly one native backend. Report physical-device, Windows
 runtime, CI, cross-build and simulated-interruption results separately.
