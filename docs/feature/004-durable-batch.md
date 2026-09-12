@@ -1,6 +1,12 @@
 # 004: Durable batch append and recovery
 
-Status: implemented and verified as recorded below; checkpointing deferred to 005.
+Status: implemented and verified as recorded below; checkpointing deferred.
+
+Scheduling note (2026-09-12): this note originally assigned checkpointing to
+feature 005. Feature 005 became the repeatable testing suite
+([005-testing-suite.md](005-testing-suite.md)). Checkpointing, main storage
+and WAL reclamation remain deferred with no number reserved. Mentions of
+"feature 005" below are historical and mean that later checkpointing feature.
 Prerequisite verified: freshly fetched origin/main e307196 includes feature 003.
 Branch: codex/004-durable-batch. Initial worktree and index were clean.
 

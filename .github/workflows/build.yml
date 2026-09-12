@@ -1,4 +1,9 @@
-name: Build
+name: Tests
+
+# Every job calls the same runner and profile definitions as local runs
+# (tools/test.py, tools/inventory.json). Reports and logs are uploaded even
+# when a job fails. Native Windows runtime coverage is a separate job from
+# the MinGW cross-build, which only compiles.
 
 on:
   pull_request:
@@ -11,76 +16,72 @@ permissions:
   contents: read
 
 jobs:
-  unix:
-    name: C99 (${{ matrix.os }})
+  local:
+    name: local profiles (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Build and run example and storage tests
+      - name: Doctor
+        run: python3 tools/test.py doctor
+      - name: Run native, sanitize and runner profiles
+        run: python3 tools/test.py run local --jobs 2 --timeout 300
+      - name: Ordinary Make build and fast native check
         run: make check
+      - name: Upload reports and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-runs-local-${{ matrix.os }}
+          path: build/test-runs
+          if-no-files-found: warn
 
-  linux_32:
-    name: C99 (Linux x86 32-bit)
+  containers:
+    name: container profiles (linux, linux32, windows-cross)
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
-      - name: Install 32-bit compiler support
-        run: sudo apt-get update && sudo apt-get install -y gcc-multilib
-      - name: Build and test with 64-bit file offsets
-        run: make CC="gcc -m32" check
+      - name: Prepare pinned toolchain image
+        run: python3 tools/test.py prepare
+      - name: Linux x86-64
+        run: python3 tools/test.py run linux --jobs 2 --timeout 300
+      - name: Linux x86 32-bit
+        if: ${{ !cancelled() }}
+        run: python3 tools/test.py run linux32 --jobs 2 --timeout 300
+      - name: Windows x86-64 MinGW cross-build
+        if: ${{ !cancelled() }}
+        run: python3 tools/test.py run windows-cross --jobs 2 --timeout 300
+      - name: Upload reports and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-runs-containers
+          path: build/test-runs
+          if-no-files-found: warn
 
   windows:
-    name: C99 (Windows x64)
+    name: windows-native (Windows Server 2022 x64, Clang + SDK)
     runs-on: windows-2022
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Build and run example
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force build | Out-Null
-          clang -std=c99 -Wall -Wextra -Wpedantic -Werror -I. timelite.c file_io_windows.c examples/basic.c -o build/basic.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ./build/basic.exe
-          exit $LASTEXITCODE
-      - name: Build and run Windows file I/O tests
+      - name: Doctor
         shell: pwsh
         run: |
           Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, OSArchitecture
-          clang --version
-          Get-ChildItem 'C:/Program Files (x86)/Windows Kits/10/Include' | Select-Object Name
-          clang --target=x86_64-pc-windows-msvc -std=c99 -Wall -Wextra -Wpedantic -Werror -I. file_io_windows.c tests/file_io_test.c -o build/file_io_test.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ./build/file_io_test.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          clang --target=x86_64-pc-windows-msvc -std=c99 -Wall -Wextra -Wpedantic -Werror -DTIMELITE_IO_TEST -I. file_io_windows.c tests/file_io_windows_fault_test.c -o build/file_io_fault_test.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ./build/file_io_fault_test.exe
-          exit $LASTEXITCODE
-      - name: Build and run lifecycle tests
+          python tools/test.py doctor
+      - name: Run windows-native profile
         shell: pwsh
-        run: |
-          clang --target=x86_64-pc-windows-msvc -std=c99 -Wall -Wextra -Wpedantic -Werror -I. timelite.c file_io_windows.c tests/lifecycle_test.c -o build/lifecycle_test.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ./build/lifecycle_test.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          clang --target=x86_64-pc-windows-msvc -std=c99 -Wall -Wextra -Wpedantic -Werror -I. timelite.c tests/lifecycle_fault_test.c -o build/lifecycle_fault_test.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ./build/lifecycle_fault_test.exe
-          exit $LASTEXITCODE
-      - name: Build and run batch tests
-        shell: pwsh
-        run: |
-          clang --target=x86_64-pc-windows-msvc -std=c99 -Wall -Wextra -Wpedantic -Werror -I. timelite.c file_io_windows.c examples/batches.c -o build/batches.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          clang --target=x86_64-pc-windows-msvc -std=c99 -Wall -Wextra -Wpedantic -Werror -I. timelite.c file_io_windows.c tests/batch_test.c -o build/batch_test.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ./build/batch_test.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          clang --target=x86_64-pc-windows-msvc -std=c99 -Wall -Wextra -Wpedantic -Werror -I. timelite.c tests/batch_model_test.c -o build/batch_model_test.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ./build/batch_model_test.exe
-          exit $LASTEXITCODE
+        run: python tools/test.py run windows-native --jobs 2 --timeout 300
+      - name: Upload reports and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-runs-windows
+          path: build/test-runs
+          if-no-files-found: warn

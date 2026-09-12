@@ -4,7 +4,8 @@ A small embedded time-series database project in C99. The current version is a
 library with durable sensor batch append, recovery, and sequential reading from a
 separate WAL on supported local POSIX filesystems. The original v1 lifecycle API
 remains available. Windows retains lifecycle and file I/O; durable batch
-provisioning currently returns `ENOTSUP`. Checkpointing is deferred to feature 005.
+provisioning currently returns `ENOTSUP`. Checkpointing remains deferred to a later
+feature; feature 005 is the repeatable testing suite described under Testing.
 
 The direction is a small C API, explicit memory ownership, no third-party
 dependencies, and a narrow scope for sensor history. Target devices include x86
@@ -12,22 +13,24 @@ and ARM32; device support has not been verified yet.
 
 ## Build
 
-On Linux or macOS, install a C99 compiler, Make, and ar, then run:
+On Linux or macOS, install a C99 compiler, Make, ar and Python 3 (used only by
+the test runner, never by the library), then run:
 
 ```sh
 make check
 ```
 
-This creates build/libtimelite.a, build/basic, build/batches, and storage test programs.
-It runs the example (shown below), temporary-file tests, deterministic file-I/O, lifecycle and provisioning fault tests,
-and a volatile/persisted batch storage model:
+This builds build/libtimelite.a, build/basic and build/batches with Make, then
+runs the native test profile through the runner (see Testing). The example prints:
 
 ```text
 Timelite 0.1.0-dev
 ```
 
-Use make clean to remove build output. To select another compiler, use
-make CC=clang check. Clean first when changing compiler flags or toolchains.
+Use `make clean` to remove all build output, including test reports. To select
+another compiler or flags, use `make CC=clang check` or `make CFLAGS=-O2 check`;
+Make records the toolchain and flags in build/flags and rebuilds its outputs
+automatically when they change.
 
 You can also compile the library directly into an application:
 
@@ -37,29 +40,146 @@ cc -std=c99 -Wall -Wextra -Wpedantic -Werror -I. timelite.c file_io.c examples/b
 ./build/basic-direct
 ```
 
-On Windows x64, install Clang and the Windows SDK (including the Visual C++
-build tools), then run these commands in PowerShell:
+On Windows x64, install Clang with llvm-ar and the Windows SDK (including the
+Visual C++ build tools) and Python 3, then run in PowerShell:
 
 ```powershell
-New-Item -ItemType Directory -Force build
-clang -std=c99 -Wall -Wextra -Wpedantic -Werror -I. timelite.c file_io_windows.c examples/basic.c -o build/basic.exe
-./build/basic.exe
-clang --target=x86_64-pc-windows-msvc -std=c99 -Wall -Wextra -Wpedantic -Werror -I. file_io_windows.c tests/file_io_test.c -o build/file_io_test.exe
-./build/file_io_test.exe
-clang --target=x86_64-pc-windows-msvc -std=c99 -Wall -Wextra -Wpedantic -Werror -DTIMELITE_IO_TEST -I. file_io_windows.c tests/file_io_windows_fault_test.c -o build/file_io_fault_test.exe
-./build/file_io_fault_test.exe
-clang --target=x86_64-pc-windows-msvc -std=c99 -Wall -Wextra -Wpedantic -Werror -I. timelite.c file_io_windows.c tests/lifecycle_test.c -o build/lifecycle_test.exe
-./build/lifecycle_test.exe
-clang --target=x86_64-pc-windows-msvc -std=c99 -Wall -Wextra -Wpedantic -Werror -I. timelite.c tests/lifecycle_fault_test.c -o build/lifecycle_fault_test.exe
-./build/lifecycle_fault_test.exe
+python tools/test.py run windows-native
 ```
 
-The Makefile uses Unix shell commands. GitHub Actions has Linux, macOS, and
-Windows public-library smoke checks, plus file-I/O and lifecycle tests on Linux/macOS, Windows
-Server 2022 x64, and a Linux x86 32-bit job. Windows CI records OS and Clang
-versions and installed SDKs. Windows runtime/SDK validation is pending; local
-Windows checks so far are MinGW-w64 cross-compilation only. CI runs are separate
-from validation on the target devices.
+This builds the static library with `clang --target=x86_64-pc-windows-msvc`
+and runs every Windows-applicable test: the public examples, file I/O, Windows
+API fault, lifecycle and batch tests. Native batch provisioning is expected to
+return `ENOTSUP` there, and the suite records that as the verified contract. A
+direct public-library smoke build is still one command:
+
+```powershell
+clang -std=c99 -Wall -Wextra -Wpedantic -Werror -I. timelite.c file_io_windows.c examples/basic.c -o build/basic.exe
+```
+
+## Testing
+
+Verification is routine: register a test once, run a documented command and
+read a summary. The suite is a Python 3 standard-library runner
+([tools/test.py](tools/test.py)), one explicit inventory
+([tools/inventory.json](tools/inventory.json)) shared with CI, and a pinned
+Docker toolchain image ([tools/docker/Dockerfile](tools/docker/Dockerfile)).
+Production code and all behavior, fault and model tests stay in C99.
+
+### Quick start
+
+```sh
+make check                                  # fast native check while iterating
+python3 tools/test.py list                  # groups, profiles, inventory
+python3 tools/test.py doctor                # which tools and images are available
+python3 tools/test.py run local             # native + sanitize + runner self-tests
+python3 tools/test.py prepare               # build the Docker image once (network)
+python3 tools/test.py run preflight         # local + linux + linux32 + windows-cross
+python3 tools/test.py run native --test batch
+python3 tools/test.py run linux32 --jobs 4 --timeout 300
+python3 tools/test.py run native --test-root /mnt/ext4-scratch
+```
+
+`run` takes one profile or group, `--test NAME` for exactly one inventory
+entry, `--jobs N` (1..8, default 2) for parallel tests within a configuration,
+`--timeout SECONDS` per command (default 120), `--test-root DIR` for storage
+tests on a chosen filesystem, and `--output DIR` for a new run directory.
+Ctrl-C stops owned child processes and containers and still writes reports.
+
+### Profiles and groups
+
+| Profile | Where | What |
+| --- | --- | --- |
+| `native` | host | host compiler, strict C99, every applicable test executed |
+| `sanitize` | host | same with AddressSanitizer and UndefinedBehaviorSanitizer |
+| `runner` | host | unit tests of the runner itself ([tools/test_runner.py](tools/test_runner.py)) |
+| `linux` | Docker | Debian gcc, x86-64 |
+| `linux32` | Docker | Debian gcc `-m32`, x86 32-bit with 64-bit file offsets |
+| `windows-cross` | Docker | MinGW-w64 x86-64 cross-compilation only, nothing executed |
+| `windows-native` | Windows host | Clang with the Windows SDK, tests executed |
+
+`local` is exactly `native + sanitize + runner`. `preflight` is `local` plus
+`linux + linux32 + windows-cross`. A profile whose tools are missing is reported
+BLOCKED and fails the group; nothing is silently dropped. Container profiles
+always request `linux/amd64`; on an ARM64 host they run under emulation and
+the report says so. A container result is never an ARM32 or device result.
+
+### Preparation
+
+`prepare` builds the image from the checked-in Dockerfile. The base image is
+pinned by digest; package versions come from the Debian repositories at build
+time and are recorded in /etc/timelite-toolchain.txt inside the image, printed
+by `prepare` and stored in every container report. The tag is derived from the
+Dockerfile hash, so editing it requires another `prepare`. Prepared runs use
+`--network=none`, mount the source snapshot read-only and write only to the run
+directory (plus a private child of `--test-root` when given). No privileged
+containers or host devices are used.
+
+### Results
+
+Statuses are PASS, FAIL, SKIP, BLOCKED and NOT RUN, each with a reason. A run
+passes only when at least one test passed and every other row is a PASS or an
+optional SKIP. Required skips, BLOCKED, NOT RUN, timeouts, missing tools, an
+empty selection and a source change during the run all fail the run. Test
+programs use fixed exit codes: 0 pass, 77 durable provisioning unsupported on
+the storage, 78 required group not run (the >4 GiB sparse group); anything else
+is a failure. Failures name the test case and the injected boundary, not only
+an assertion line.
+
+Coverage is separated explicitly. `storage_probe` reports whether the run's
+storage supports durable provisioning. On supported storage the `batch` test is
+recorded as "native batch behavior exercised"; on Windows the `ENOTSUP` result
+is the verified contract; in containers an unsupported overlay or shared
+filesystem records an optional skip labelled "native batch behavior NOT RUN",
+which is not durability evidence. The `native` and `sanitize` profiles require
+supported storage: pass `--test-root` with a directory on a supported local
+filesystem when the default location is not one. Model interruptions, native
+runtime, cross-compilation, CI, device and physical power-cut testing are
+reported separately; the suite covers the first four.
+
+### Artifacts and failure diagnosis
+
+Every run creates a unique directory `build/test-runs/run-<time>-<id>/` with
+`source/` (the bounded snapshot every profile built from), one folder per
+profile holding binaries and one `.log` per command, `report.json` (source
+digest, Git commit and dirty files, host and target architecture, compiler
+version, image identity, exact commands, timings, exit codes) and `junit.xml`.
+On failure the summary prints the failing command, its log path and an exact
+rerun command such as `python3 tools/test.py run native --test batch`. Failing
+tests keep their private storage directory. Nothing outside the run directory
+is written or cleaned; `make clean` removes all of build/.
+
+### Adding tests
+
+- New C test: add `tests/<name>_test.c` and one entry to
+  [tools/inventory.json](tools/inventory.json) with `name`, `source`,
+  `backend` (`library` links build output libtimelite.a; `native` compiles the
+  test with one native backend; `fake` compiles it with timelite.c only;
+  `none` compiles the test alone), optional `defines`, `platforms`
+  (`posix`, `windows`), a `coverage` sentence, optional `execution`
+  (`batch`, `batch-example`, `probe`) and optional expected `stdout`. Nothing
+  else changes: Make, CI and the runner all read the inventory.
+- New case in an existing test: add it to the C file and wrap the loop or
+  step in `TEST_CASE(name, boundary)` from tests/test_assert.h so failures
+  report which case and boundary broke. No runner change is needed.
+- Runner behavior: add a unit test to tools/test_runner.py; it runs in the
+  `runner` profile.
+
+### Continuous integration
+
+[.github/workflows/build.yml](.github/workflows/build.yml) calls the same
+runner and profiles: `local` on Ubuntu and macOS plus `make check`, the three
+container profiles on an Ubuntu x86-64 runner after `prepare`, and
+`windows-native` on Windows Server 2022 x64 with Clang and the SDK. Every job
+uploads build/test-runs even when it fails and has a bounded timeout. CI
+results are separate from local runs and from device or power-cut testing.
+
+### Stopping rule
+
+When the required checks pass for the relevant source and that source has not
+changed, stop. Rerun only after a change, a failure or for a concrete coverage
+gap. An ad hoc command that provides reusable coverage belongs in the inventory
+or runner, not in a chat transcript.
 
 ## Durable sensor batches (v2)
 
@@ -156,8 +276,9 @@ open handle or externally modify, rename, replace or delete its files/directorie
 
 The WAL limit is 64 MiB including its 32-byte header. A batch occupies
 64 + 20 × record count bytes (84..1344). `TIMELITE_WAL_FULL` rejects a batch
-before writes; committed data is never overwritten or reclaimed. Feature 005
-must checkpoint into main storage before reclaiming WAL capacity. This feature
+before writes; committed data is never overwritten or reclaimed. A later
+checkpointing feature must move batches into main storage before reclaiming WAL
+capacity. This feature
 provides no rotation, retention, segments, indexes or queries beyond batch reading.
 
 `timelite_batches_next` returns only whole validated batches. `TIMELITE_END`
@@ -263,7 +384,7 @@ visibility. See [feature 003](docs/feature/003-database-lifecycle.md) for exact
 validation order, ownership, format evolution and the proposed WAL contract.
 
 The separate v2 batch API above implements WAL append and recovery. Checkpointing
-and main-storage segments remain deferred to feature 005.
+and main-storage segments remain deferred to a later feature.
 
 ## Internal file I/O
 
@@ -316,12 +437,15 @@ are in [feature 001](docs/feature/001-file-io.md).
 - timelite.c: public library implementation.
 - file_io.h: internal file-operation contract.
 - file_io.c and file_io_windows.c: POSIX and Windows implementations.
-- tests/: temporary-file and deterministic syscall fault tests.
+- tests/: temporary-file, deterministic fault, model and storage probe tests.
+- tools/test.py, tools/inventory.json, tools/test_runner.py, tools/docker/:
+  test runner, shared inventory, runner self-tests and the toolchain image.
 - examples/basic.c: a small application that calls the library.
 - examples/batches.c: complete v2 create/append/read/reopen application.
 - [AGENTS.md](AGENTS.md) and [CLAUDE.md](CLAUDE.md): coding-agent instructions.
 - [docs/feature/000-init.md](docs/feature/000-init.md): bootstrap scope and results.
 - [docs/feature/003-database-lifecycle.md](docs/feature/003-database-lifecycle.md): lifecycle, header, failure analysis and future WAL contract.
+- [docs/feature/005-testing-suite.md](docs/feature/005-testing-suite.md): testing suite design, verification results and gaps.
 
 ## Contributions
 

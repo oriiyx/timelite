@@ -3,7 +3,7 @@
  * disappear. Previously synced bytes are never damaged by later writes. */
 #include "timelite.h"
 #include "file_io.h"
-#include <assert.h>
+#include "test_assert.h"
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
@@ -82,6 +82,7 @@ static void crash(void)
     int i;
     for (i = 0; i < 2; i++)
     {
+        TEST_CASE(__func__, i);
         struct model_file *f = &files[i];
         memcpy(f->bytes, f->stable, f->stable_length);
         f->length = f->stable_length;
@@ -267,6 +268,7 @@ static void check_batches(struct timelite_batches *db, size_t expected)
     assert(timelite_batches_rewind(db) == 0);
     for (i = 0; i < expected; i++)
     {
+        TEST_CASE(__func__, i);
         assert(timelite_batches_next(db, output, 64, &count, &sequence,
                                     scratch, sizeof(scratch)) == 0);
         assert(sequence == i + 1 && count == 1);
@@ -291,8 +293,10 @@ static void interruptions(void)
      * before and after effects. Persisted commit can appear after lost success. */
     for (boundary = 1; boundary <= 4; boundary++)
     {
+        TEST_CASE(__func__, boundary);
         for (after = 0; after <= 1; after++)
         {
+            TEST_CASE(after ? "append after effect" : "append before effect", boundary);
             new_db(&db);
             assert(timelite_batches_append(&db, input, 1, scratch,
                                           sizeof(scratch), &sequence) == 0);
@@ -317,6 +321,7 @@ static void interruptions(void)
      * Allow unsynced bytes to reach stable storage before the interruption. */
     for (prefix = 0; prefix < 52; prefix++)
     {
+        TEST_CASE(__func__, prefix);
         new_db(&db);
         transfer_limit = prefix;
         assert(timelite_batches_append(&db, input, 1, scratch,
@@ -352,6 +357,7 @@ static void failures(void)
     int failure, error, previous;
     for (failure = 1; failure <= 8; failure++)
     {
+        TEST_CASE(__func__, failure);
         new_db(&db);
         assert(timelite_batches_append(&db, input, 1, scratch, sizeof(scratch), &sequence) == 0);
         assert(timelite_batches_close(&db) == 0);
@@ -400,6 +406,7 @@ static void failures(void)
     /* Interrupted tail cleanup: truncate before/after effects and final sync. */
     for (failure = 1; failure <= 4; failure++)
     {
+        TEST_CASE(__func__, failure);
         new_db(&db);
         fail_operation = 3;
         assert(timelite_batches_append(&db, input, 1, scratch, sizeof(scratch), &sequence) == EIO);
@@ -429,6 +436,7 @@ static void creation(void)
     int i;
     for (i = 1; i <= 8; i++)
     {
+        TEST_CASE(__func__, i);
         reset();
         assert(timelite_batches_init(&db) == 0);
         if (i == 1)
@@ -472,6 +480,7 @@ static void creation(void)
     /* Race winner supplies a complete pair, or disappears before bounded open. */
     for (i = 2; i <= 3; i++)
     {
+        TEST_CASE(__func__, i);
         new_db(&db);
         assert(timelite_batches_close(&db) == 0);
         reset(); /* Retain fixture bytes, but remove modeled names. */
@@ -503,6 +512,7 @@ static void fixture_crc(unsigned char *bytes, size_t length)
     unsigned int j;
     for (i = 0; i < length; i++)
     {
+        TEST_CASE(__func__, i);
         crc ^= bytes[i];
         for (j = 0; j < 8; j++)
         {
@@ -512,6 +522,7 @@ static void fixture_crc(unsigned char *bytes, size_t length)
     crc = ~crc;
     for (i = 0; i < 4; i++)
     {
+        TEST_CASE(__func__, i);
         bytes[length + i] = (unsigned char)(crc >> (i * 8));
     }
 }
@@ -532,6 +543,7 @@ static void format_cases(void)
         "\xbb\xf6\xda\x72";
     for (i = 0; i < 8; i++)
     {
+        TEST_CASE(__func__, i);
         new_db(&db);
         assert(timelite_batches_append(&db, input, 1, scratch, sizeof(scratch), &sequence) == 0);
         assert(sizeof(expected_frame) - 1 == 84);
@@ -581,6 +593,7 @@ static void format_cases(void)
     /* All incomplete creation-header prefixes; artifacts remain untouched. */
     for (prefix = 0; prefix < 32; prefix++)
     {
+        TEST_CASE(__func__, prefix);
         reset();
         assert(timelite_batches_init(&db) == 0);
         transfer_limit = prefix;

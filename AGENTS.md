@@ -5,7 +5,8 @@
 Timelite is a small embedded time-series database project written in C99.
 The code implements v1 lifecycle plus a separate v2 durable sensor batch API,
 with a paired WAL, recovery and sequential batch reading. The WAL is capped at
-64 MiB; checkpointing/main storage/reclamation are deferred to feature 005.
+64 MiB; checkpointing/main storage/reclamation remain deferred to a later feature
+with no number reserved (feature 005 became the repeatable testing suite).
 Batch operations use caller-owned scratch, integer records and serialized ownership.
 Durable provisioning is implemented for selected local Linux/macOS filesystems;
 Windows batch provisioning explicitly returns ENOTSUP. v1 creation retains its
@@ -72,19 +73,43 @@ Use simple, explicit C99 in the style requested by the user:
 
 ## Build and verification
 
-- Run make check for a normal local check. It builds the static library and runs
-  examples plus file-I/O, lifecycle, provisioning and batch tests, including a
-  deterministic volatile/persisted recovery model. Model tests do not prove
-  physical power-loss safety. Direct public-library
-  builds must link exactly one native file backend.
-- Keep builds warning-free under the default strict C99 flags.
-- When changing compiler flags, run make clean first; Make does not track changes
-  to command-line variables. CC and AR can be overridden on the make command line.
+- Standard workflow: `make check` is the fast native entry point. It builds the
+  library and examples with Make, then runs `python3 tools/test.py run native`.
+  Before handing work back, run `python3 tools/test.py run local` (native +
+  sanitize + runner self-tests). Before a pull request, prepare the Docker image
+  once with `python3 tools/test.py prepare` and run
+  `python3 tools/test.py run preflight` (local + linux + linux32 + windows-cross).
+  `python3 tools/test.py doctor` explains missing tools; `list` shows profiles
+  and the inventory. See README.md "Testing" for statuses and artifacts.
+- Tests are registered once in tools/inventory.json, which the runner and CI
+  share. Adding a C test is one inventory entry plus the source file; adding a
+  case to an existing test needs no runner change. Do not add test lists to the
+  Makefile or workflows.
+- Test programs return 0 on success, 77 when durable provisioning is
+  unsupported on the storage (the expected contract on Windows) and 78 when a
+  required group could not run. Any other exit is a failure. Use test_assert.h
+  (never <assert.h>) so checks survive NDEBUG and name the case and boundary.
+- Every run gets a unique directory under build/test-runs with a source
+  snapshot, per-command logs, report.json and junit.xml. Results are marked
+  stale if the working tree changes during the run. A container run on an
+  overlay or shared filesystem records native batch coverage as NOT RUN; it is
+  not durability evidence. Model tests do not prove physical power-loss safety.
+- Stopping rule: once the required checks pass for the relevant source and
+  that source is unchanged, stop testing. Rerun only for a source change, a
+  failure, or a concrete unresolved coverage gap. When an ad hoc command
+  provides reusable coverage, turn it into an inventory test or runner
+  operation instead of repeating it by hand.
+- Keep builds warning-free under the strict C99 flags; the runner always adds
+  them. CC, AR, CPPFLAGS, CFLAGS, LDFLAGS and LDLIBS override the host
+  toolchain for Make and for the native/sanitize/windows-native profiles. Make
+  rebuilds automatically when flags change; `make clean` also removes
+  build/test-runs.
+- Direct public-library builds must link exactly one native file backend.
 - Add focused tests as real behavior appears. Storage changes need failure and
   recovery tests; do not add tests that merely duplicate trivial implementation.
-- GitHub Actions checks Linux and macOS with Make, Linux x86 32-bit file offsets, and
-  Windows Server 2022 x64 with Clang directly (public library, backend and batch
-  model tests; native batches verify unsupported provisioning).
-  Report local results separately from CI and device results. Never claim unrun
-  checks passed.
+- GitHub Actions runs the same profiles: `local` on Linux and macOS, the three
+  container profiles on Linux x86-64 runners (no emulation there),
+  and `windows-native` on Windows Server 2022 x64 with Clang and the SDK.
+  Reports are uploaded even on failure. Report local results separately from
+  CI and device results. Never claim unrun checks passed.
 - Do not add database features as part of unrelated setup or documentation work.

@@ -5,7 +5,7 @@
 #define _DARWIN_C_SOURCE
 #include "timelite.h"
 #include "file_io.h"
-#include <assert.h>
+#include "test_assert.h"
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +14,7 @@
 #include "windows_test_paths.h"
 #else
 #include <unistd.h>
+#include "posix_test_paths.h"
 #define remove_test_file unlink
 #define remove_test_directory rmdir
 #endif
@@ -23,9 +24,9 @@ int main(void)
 #if defined(_WIN32)
     char directory[MAX_PATH];
 #else
-    char directory[] = "/tmp/timelite-batch-XXXXXX";
+    char directory[4096];
 #endif
-    char path[512], wal_path[512];
+    char path[4608], wal_path[4608];
     struct timelite_batches db;
     struct timelite_db legacy;
     struct timelite_file file = TIMELITE_FILE_INIT;
@@ -37,11 +38,7 @@ int main(void)
     uint64_t sequence = 99, size;
     size_t count = 99, transferred, prefix;
     int error;
-#if defined(_WIN32)
     assert(make_test_directory(directory, sizeof(directory)));
-#else
-    assert(mkdtemp(directory) != NULL);
-#endif
     assert(snprintf(path, sizeof(path), "%s/db-\xc5\xbe", directory) < (int)sizeof(path));
     assert(snprintf(wal_path, sizeof(wal_path), "%s/wal-\xc5\xbe", directory) < (int)sizeof(wal_path));
     assert(timelite_batches_init(&db) == 0);
@@ -57,8 +54,12 @@ int main(void)
         (void)remove_test_file(wal_path);
         assert(remove_test_directory(directory) == 0);
         puts("batch native: unsupported provisioning correctly rejected; behavior tested by model");
-        return 0;
+        return 77;
     }
+#if defined(_WIN32)
+    /* Windows has no namespace durability protocol; reaching here is a bug. */
+    assert(error == ENOTSUP);
+#endif
     assert(error == 0);
     assert(timelite_batches_next(&db, output, 2, &count, &sequence,
                                 scratch, sizeof(scratch)) == TIMELITE_END);
@@ -100,6 +101,7 @@ int main(void)
      * header and incomplete body/commit is safely discarded under the model. */
     for (prefix = 0; prefix <= 104; prefix++)
     {
+        TEST_CASE("frame prefix or corruption byte", prefix);
         assert(timelite_file_open(&file, wal_path) == 0);
         assert(timelite_file_write(&file, 0, saved, sizeof(saved), &transferred) == 0);
         assert(timelite_file_truncate(&file, 136 + prefix) == 0);
@@ -119,6 +121,7 @@ int main(void)
     /* Every byte in committed framing/payload/commit detects single-bit damage. */
     for (prefix = 32; prefix < sizeof(saved); prefix++)
     {
+        TEST_CASE("frame prefix or corruption byte", prefix);
         assert(timelite_file_open(&file, wal_path) == 0);
         assert(timelite_file_write(&file, 0, saved, sizeof(saved), &transferred) == 0);
         assert(timelite_file_truncate(&file, sizeof(saved)) == 0);

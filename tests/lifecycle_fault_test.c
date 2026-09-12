@@ -1,7 +1,7 @@
 /* Linked instead of the native backend; production has no hooks or test state. */
 #include "timelite.h"
 #include "file_io.h"
-#include <assert.h>
+#include "test_assert.h"
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
@@ -137,6 +137,7 @@ int main(void)
     assert(timelite_init(&db) == 0);
     for (i = 1; i <= 3; i++)
     {
+        TEST_CASE(__func__, i);
         reset(0);
         race = i;
         assert(timelite_open(&db, "db", TIMELITE_OPEN_OR_CREATE) ==
@@ -154,6 +155,7 @@ int main(void)
     assert(writes == 0 && closes == 0);
     for (i = 0; i < 12; i++)
     {
+        TEST_CASE(__func__, i);
         reset(0);
         write_limit = (size_t)i;
         write_error = i % 2 ? ENOSPC : 0;
@@ -183,6 +185,7 @@ int main(void)
     assert(timelite_close(&db) == 0);
     for (i = 0; i < 14; i++)
     {
+        TEST_CASE(__func__, i);
         reset(1);
         close_error = EACCES;
         if (i < 12)

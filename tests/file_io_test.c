@@ -17,6 +17,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "posix_test_paths.h"
 #define IS_CLOSED(file) ((file).fd == -1)
 #define remove_test_file unlink
 #define remove_test_directory rmdir
@@ -32,9 +33,9 @@ int main(void)
     char directory[MAX_PATH];
     char path[MAX_PATH];
 #else
-    char directory[] = "/tmp/timelite-io-XXXXXX";
-    char path[128];
-    char link_path[128];
+    char directory[4096];
+    char path[4608];
+    char link_path[4608];
 #endif
     struct timelite_file file = TIMELITE_FILE_INIT;
     struct timelite_file other = TIMELITE_FILE_INIT;
@@ -43,17 +44,14 @@ int main(void)
     uint64_t size = 99;
     uint64_t large_offset = UINT64_C(4294967296) + 17;
     int failed = 0;
+    int skipped = 0;
     int created = 0;
 #if !defined(_WIN32)
     int linked = 0;
 #endif
     int error;
 
-#if defined(_WIN32)
     if (!make_test_directory(directory, sizeof(directory)))
-#else
-    if (mkdtemp(directory) == NULL)
-#endif
     {
 #if defined(_WIN32)
         fprintf(stderr, "temporary directory creation failed: %lu\n", GetLastError());
@@ -138,12 +136,14 @@ int main(void)
     CHECK(error >= 0);
     if (error == 0)
     {
+        skipped = 1;
         goto sparse_done;
     }
 #endif
     error = timelite_file_write(&file, large_offset, "Z", 1, &count);
     if (error == EFBIG || error == ENOTSUP)
     {
+        skipped = 1;
         printf("SKIP sparse >4 GiB: filesystem error %d\n", error);
     }
     else
@@ -225,9 +225,16 @@ cleanup:
 #endif
         failed = 1;
     }
-    if (!failed)
+    if (failed)
     {
-        puts("file I/O integration: passed");
+        return 1;
     }
-    return failed;
+    if (skipped)
+    {
+        /* Exit 78 tells the runner a required group did not run. */
+        puts("file I/O integration: passed, sparse >4 GiB group SKIPPED");
+        return 78;
+    }
+    puts("file I/O integration: passed");
+    return 0;
 }

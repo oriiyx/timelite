@@ -2,7 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 #define _DARWIN_C_SOURCE
 #include "file_io.h"
-#include <assert.h>
+#include "test_assert.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <string.h>
@@ -102,6 +102,7 @@ int main(void)
     count = step;
     for (i = 1; i <= count; i++)
     {
+        TEST_CASE(__func__, i);
         step = close_count = named_calls = 0;
         fail_step = i;
         assert(timelite_file_provision(&file, "/owned/db") == EIO);
@@ -110,6 +111,7 @@ int main(void)
     }
     for (i = 1; i <= 2; i++)
     {
+        TEST_CASE(__func__, i);
         step = fail_step = named_calls = 0;
         swapped = i;
         assert(timelite_file_provision(&file, "/owned/db") == EINVAL);

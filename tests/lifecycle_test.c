@@ -13,6 +13,7 @@
 #include "windows_test_paths.h"
 #else
 #include <unistd.h>
+#include "posix_test_paths.h"
 #define remove_test_file unlink
 #define remove_test_directory rmdir
 #endif
@@ -24,8 +25,8 @@ int main(void)
     char directory[MAX_PATH];
     char path[MAX_PATH];
 #else
-    char directory[] = "/tmp/timelite-db-XXXXXX";
-    char path[128];
+    char directory[4096];
+    char path[4608];
 #endif
     struct timelite_db db;
     struct timelite_file file = TIMELITE_FILE_INIT;
@@ -41,11 +42,7 @@ int main(void)
     int error;
 
     (void)timelite_init(&db);
-#if defined(_WIN32)
     if (!make_test_directory(directory, sizeof(directory)))
-#else
-    if (mkdtemp(directory) == NULL)
-#endif
     {
         return 1;
     }
