@@ -8,6 +8,8 @@ int main(int argc, char **argv)
     struct timelite_batches db;
     struct timelite_record input[] = {{7, UINT64_C(1700000000000000), 23500},
                                       {7, UINT64_C(1700000060000000), 23625}};
+    struct timelite_range range = {UINT64_C(1700000000000000),
+                                   UINT64_C(1700000060000001), 7, 1};
     struct timelite_record output[TIMELITE_MAX_RECORDS];
     unsigned char scratch[TIMELITE_BATCH_SCRATCH];
     uint64_t sequence;
@@ -55,7 +57,14 @@ int main(int argc, char **argv)
         fprintf(stderr, "reopen failed: %d\n", error);
         return 1;
     }
-    while ((error = timelite_batches_next(&db, output, TIMELITE_MAX_RECORDS,
+    error = timelite_batches_seek(&db, range.from_us, scratch, sizeof(scratch));
+    if (error != 0 && error != TIMELITE_END)
+    {
+        (void)timelite_batches_close(&db);
+        fprintf(stderr, "seek failed: %d\n", error);
+        return 1;
+    }
+    while ((error = timelite_batches_next_range(&db, &range, output, TIMELITE_MAX_RECORDS,
                                           &count, &sequence, scratch,
                                           sizeof(scratch))) == 0)
     {

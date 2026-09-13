@@ -7,7 +7,8 @@ database file as immutable segments and the WAL is reclaimed only after that
 install is durable, on supported local POSIX filesystems. The original v1
 lifecycle API remains available. Windows retains lifecycle and file I/O; durable
 batch provisioning currently returns `ENOTSUP`. Feature 005 is the repeatable
-testing suite described under Testing; feature 006 is checkpointing.
+testing suite described under Testing; feature 006 is checkpointing and feature
+007 adds globally ordered append, timestamp seek and filtered window reads.
 
 The direction is a small C API, explicit memory ownership, no third-party
 dependencies, and a narrow scope for sensor history. Target devices include x86
@@ -191,7 +192,7 @@ Build it with `make`, then run `./build/batches DATABASE WAL` using two unused
 paths in an existing, stable, already-durable local directory. It creates a pair,
 appends one batch, checkpoints it into the main file, appends a second batch
 that stays in the WAL, closes, reopens, and reads both committed batches in
-order. It leaves both files in place. On unsupported provisioning, including
+order through a seek and a series-filtered time window. It leaves both files in place. On unsupported provisioning, including
 Windows, creation returns an error; partial artifacts may remain and are never
 automatically deleted.
 
@@ -206,6 +207,8 @@ int main(int argc, char **argv)
     struct timelite_batches db;
     struct timelite_record input[] = {{7, UINT64_C(1700000000000000), 23500},
                                       {7, UINT64_C(1700000060000000), 23625}};
+    struct timelite_range range = {UINT64_C(1700000000000000),
+                                   UINT64_C(1700000060000001), 7, 1};
     struct timelite_record output[TIMELITE_MAX_RECORDS];
     unsigned char scratch[TIMELITE_BATCH_SCRATCH];
     uint64_t sequence;
@@ -253,7 +256,14 @@ int main(int argc, char **argv)
         fprintf(stderr, "reopen failed: %d\n", error);
         return 1;
     }
-    while ((error = timelite_batches_next(&db, output, TIMELITE_MAX_RECORDS,
+    error = timelite_batches_seek(&db, range.from_us, scratch, sizeof(scratch));
+    if (error != 0 && error != TIMELITE_END)
+    {
+        (void)timelite_batches_close(&db);
+        fprintf(stderr, "seek failed: %d\n", error);
+        return 1;
+    }
+    while ((error = timelite_batches_next_range(&db, &range, output, TIMELITE_MAX_RECORDS,
                                           &count, &sequence, scratch,
                                           sizeof(scratch))) == 0)
     {
@@ -277,8 +287,12 @@ int main(int argc, char **argv)
 Each reading has a 32-bit series identifier, unsigned 64-bit microseconds since
 the Unix epoch, and signed 64-bit integer value. The application chooses units
 (e.g. thousandths of a degree); no floating-point representation is assumed.
-All field values are valid, including series zero. Input order and duplicate
-series/timestamps are preserved, with no ordering requirement or deduplication.
+All field values are valid, including series zero. Timestamps must be non-decreasing within each batch and across all committed
+batches, globally across series. Equal timestamps are accepted and preserved.
+A decrease returns `TIMELITE_OUT_OF_ORDER` (-9) before any I/O, with no effect
+on the handle, cursor or sequence output. Global order makes segment spans
+exact without per-series state in the handle. Old records remain readable in
+their original order; they are not retroactively sorted.
 Empty batches and more than 64 readings return `EINVAL` before writes.
 
 Caller owns the handle, records and scratch. Every batch operation takes at least
@@ -292,8 +306,8 @@ open handle or externally modify, rename, replace or delete its files/directorie
 The WAL limit is 64 MiB including its 32-byte header. A batch occupies
 64 + 20 × record count bytes (84..1344). `TIMELITE_WAL_FULL` rejects a batch
 before writes; committed WAL data is never overwritten and is reclaimed only by
-checkpoint. There is no rotation, retention, compaction, index or query beyond
-batch reading.
+checkpoint. There is no rotation, retention, compaction, aggregation or
+per-series index.
 
 ### Checkpoint
 
@@ -324,15 +338,25 @@ reaches it (cursor unchanged). Reading walks installed segments first, then the
 WAL, validating each frame with the same checksums.
 
 The main file layout is: 32-byte pair header, two 64-byte manifest slots,
-segments from offset 160 (32-byte header plus the WAL frames verbatim). Each
-checkpoint adds one segment; open reads one header per segment, so checkpoint
+segments from offset 160 (64-byte header plus the WAL frames verbatim; old
+feature 006 segments retain their 32-byte headers). Each
+checkpoint adds one segment; open reads headers without reading installed
+payloads for new layouts, so checkpoint
 many batches at a time rather than one. `TIMELITE_DATABASE_CAPACITY` (1 GiB)
 bounds the main file; when the next segment would not fit, checkpoint returns
 `TIMELITE_DATABASE_FULL` before any effect and appends continue until the WAL
 is full, after which the pair is read-only until a future retention feature.
 A database created by feature 004 (exactly 32 bytes) opens unchanged and gains
 its manifest slots on its first checkpoint; the feature 004 library fails closed
-without writing on a checkpointed pair. Externally cutting the main file to
+without writing on a checkpointed pair. Feature 007 adds the last installed
+timestamp at manifest bytes 32..39, last segment offset at 40..47, and marker 7
+at 48..51; its CRC remains at 60. Feature 006 fails closed on an installed 007
+pair because formerly reserved manifest bytes are nonzero and the segment magic
+is new. This is deliberate forward-incompatibility, following the 006/004 pattern;
+no automatic format migration or header overwrite is introduced. Feature 006
+segments stay readable, using a linear scan for queries and a scan of only the
+final segment to recover its last timestamp when old metadata lacks it.
+Externally cutting the main file to
 exactly its empty size (160 bytes or less) is indistinguishable from a fresh
 database and outside the recovery model, as is external WAL truncation.
 
@@ -341,6 +365,35 @@ target hardware. The interruption model, the native tests and the container and
 cross builds are separate evidence; see
 [feature 006](docs/feature/006-checkpoint.md) for the exact byte layouts,
 sync order, interruption table and results.
+
+`timelite_batches_seek(&db, from_us, scratch, size)` positions at the first batch
+whose last record timestamp is at least `from_us`. It binary-searches ordered
+segment spans using persistent backward links, then scans candidate frames and
+the WAL. Errors preserve the cursor; `TIMELITE_END` positions at the current end,
+where later serialized appends remain visible. Seek never writes.
+
+`timelite_batches_next_range(&db, &range, records, capacity, &count, &sequence,
+scratch, size)` returns the records from one batch inside `[from_us, until_us)`.
+`struct timelite_range` contains these two endpoints, `series`, and
+`filter_series` (0 for all series, 1 for that series only). It skips batches with
+no matches and shares the cursor with next, seek and rewind. Capacity counts
+matching records only. Errors, insufficient capacity and END leave all outputs
+and the cursor unchanged, even after scanning skipped batches; scratch may
+change. An inverted interval or other filter flag is `EINVAL`; an empty interval
+returns END. Ordered data permits stopping at the upper bound. Legacy unordered
+segments/WAL are scanned without assuming order; checkpoint records their spans
+with distinct `TLUNOR07` metadata. `[from, UINT64_MAX)` excludes UINT64_MAX itself;
+use the unfiltered sequential API to read that timestamp.
+
+The example output remains:
+
+```text
+batch=1 series=7 us=1700000000000000 value=23500
+batch=2 series=7 us=1700000060000000 value=23625
+```
+
+See [feature 007](docs/feature/007-time-range.md) for the segment links, exact
+layouts, compatibility behavior and verification results.
 
 `timelite_batches_next` returns only whole validated batches, installed
 segments first and then the WAL, in sequence order. `TIMELITE_END`
@@ -505,12 +558,14 @@ are in [feature 001](docs/feature/001-file-io.md).
 - tools/test.py, tools/inventory.json, tools/test_runner.py, tools/docker/:
   test runner, shared inventory, runner self-tests and the toolchain image.
 - examples/basic.c: a small application that calls the library.
-- examples/batches.c: complete v2 create/append/checkpoint/read/reopen application.
+- examples/batches.c: complete v2 create/append/checkpoint/reopen/seek/window application.
 - [AGENTS.md](AGENTS.md) and [CLAUDE.md](CLAUDE.md): coding-agent instructions.
 - [docs/feature/000-init.md](docs/feature/000-init.md): bootstrap scope and results.
 - [docs/feature/003-database-lifecycle.md](docs/feature/003-database-lifecycle.md): lifecycle, header, failure analysis and future WAL contract.
 - [docs/feature/005-testing-suite.md](docs/feature/005-testing-suite.md): testing suite design, verification results and gaps.
 - [docs/feature/006-checkpoint.md](docs/feature/006-checkpoint.md): checkpoint layout, protocol, interruption table and results.
+
+- [docs/feature/007-time-range.md](docs/feature/007-time-range.md): time spans, seek, filtered reads and verification.
 
 ## Contributions
 

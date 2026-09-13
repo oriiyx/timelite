@@ -60,6 +60,8 @@ static int capacity_fixture(struct timelite_file *file, unsigned char *scratch)
     encode_fixture(scratch + 8, 16, 8);
     encode_fixture(scratch + 16, data_end, 8);
     encode_fixture(scratch + 24, UINT64_C(800000), 8);
+    encode_fixture(scratch + 40, 160 + 15 * TIMELITE_WAL_CAPACITY, 8);
+    encode_fixture(scratch + 48, 7, 4);
     encode_fixture(scratch + 60, fixture_crc(scratch, 60), 4);
     error = timelite_file_write(file, 32, scratch, 64, &transferred);
     memset(scratch, 0, 64);
@@ -95,6 +97,208 @@ static int capacity_fixture(struct timelite_file *file, unsigned char *scratch)
     return 0;
 }
 
+/* Read errors must not publish even a partially advanced cursor. */
+static void same_cursor(const struct timelite_batches *a, const struct timelite_batches *b)
+{
+    assert(a->private_cursor == b->private_cursor);
+    assert(a->private_segment_end == b->private_segment_end);
+    assert(a->private_read_sequence == b->private_read_sequence);
+    assert(a->private_in_wal == b->private_in_wal);
+    assert(a->private_failed == b->private_failed);
+}
+
+static void time_ranges(const char *path, const char *wal_path)
+{
+    struct timelite_batches db, before;
+    struct timelite_record input[3] = {{7, 10, -1}, {8, 20, 2}, {7, 20, 3}};
+    struct timelite_record output[3];
+    struct timelite_range range = {15, 41, 7, 0};
+    unsigned char scratch[TIMELITE_BATCH_SCRATCH];
+    const uint64_t seeks[] = {0, 10, 15, 20, 21, 30, 31, 40, 41, 50, 51};
+    const uint64_t expected[] = {1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 0};
+    uint64_t sequence = 99;
+    size_t count = 99, i;
+    TEST_CASE("range empty and argument rules", 0);
+    assert(timelite_batches_init(&db) == 0);
+    assert(timelite_batches_seek(&db, 0, scratch, sizeof(scratch)) == EBADF);
+    assert(timelite_batches_next_range(&db, &range, output, 3, &count, &sequence,
+                                      scratch, sizeof(scratch)) == EBADF);
+    assert(timelite_batches_open(&db, path, wal_path, TIMELITE_CREATE_NEW,
+                                scratch, sizeof(scratch)) == 0);
+    assert(timelite_batches_seek(&db, 0, scratch, sizeof(scratch)) == TIMELITE_END);
+    assert(timelite_batches_next_range(&db, &range, output, 3, &count, &sequence,
+                                      scratch, sizeof(scratch)) == TIMELITE_END);
+    assert(count == 99 && sequence == 99);
+    before = db;
+    input[1].timestamp_us = 9;
+    assert(timelite_batches_append(&db, input, 3, scratch, sizeof(scratch), &sequence) == TIMELITE_OUT_OF_ORDER);
+    same_cursor(&db, &before);
+    assert(sequence == 99 && db.private_sequence == 0);
+    input[1].timestamp_us = 20;
+    assert(timelite_batches_append(&db, input, 3, scratch, sizeof(scratch), &sequence) == 0);
+    before = db;
+    assert(timelite_batches_append(&db, input, 1, scratch, sizeof(scratch), &sequence) == TIMELITE_OUT_OF_ORDER);
+    same_cursor(&db, &before);
+    assert(sequence == 1 && db.private_sequence == 1);
+    assert(timelite_batches_checkpoint(&db, scratch, sizeof(scratch)) == 0);
+    input[0].timestamp_us = 30;
+    input[1].timestamp_us = 40;
+    assert(timelite_batches_append(&db, input, 2, scratch, sizeof(scratch), &sequence) == 0);
+    assert(timelite_batches_checkpoint(&db, scratch, sizeof(scratch)) == 0);
+    input[0].timestamp_us = 50;
+    assert(timelite_batches_append(&db, input, 1, scratch, sizeof(scratch), &sequence) == 0);
+    assert(timelite_batches_close(&db) == 0);
+    assert(timelite_batches_open(&db, path, wal_path, TIMELITE_OPEN_EXISTING,
+                                scratch, sizeof(scratch)) == 0);
+    input[0].timestamp_us = 49;
+    before = db;
+    assert(timelite_batches_append(&db, input, 1, scratch, sizeof(scratch), &sequence) == TIMELITE_OUT_OF_ORDER);
+    same_cursor(&db, &before);
+    for (i = 0; i < sizeof(seeks) / sizeof(seeks[0]); i++)
+    {
+        TEST_CASE("seek installed and WAL boundaries", i);
+        assert(timelite_batches_seek(&db, seeks[i], scratch, sizeof(scratch)) ==
+               (expected[i] ? 0 : TIMELITE_END));
+        assert(timelite_batches_next(&db, output, 3, &count, &sequence,
+                                    scratch, sizeof(scratch)) == (expected[i] ? 0 : TIMELITE_END));
+        if (expected[i])
+        {
+            assert(sequence == expected[i]);
+        }
+    }
+    TEST_CASE("seek END sees later equal timestamp append", 0);
+    input[0].timestamp_us = 50;
+    assert(timelite_batches_append(&db, input, 1, scratch, sizeof(scratch), &sequence) == 0);
+    assert(timelite_batches_next(&db, output, 3, &count, &sequence,
+                                scratch, sizeof(scratch)) == 0 && sequence == 4);
+    assert(timelite_batches_seek(&db, 15, scratch, sizeof(scratch)) == 0);
+    before = db;
+    count = 99;
+    sequence = 99;
+    output[0].value = 12345;
+    assert(timelite_batches_next_range(&db, &range, output, 1, &count, &sequence,
+                                      scratch, sizeof(scratch)) == TIMELITE_BUFFER_TOO_SMALL);
+    same_cursor(&db, &before);
+    assert(count == 99 && sequence == 99 && output[0].value == 12345);
+    assert(timelite_batches_next_range(&db, &range, output, 3, &count, &sequence,
+                                      scratch, sizeof(scratch)) == 0);
+    assert(sequence == 1 && count == 2 && output[0].series == 8 && output[1].series == 7);
+    assert(timelite_batches_next_range(&db, &range, output, 3, &count, &sequence,
+                                      scratch, sizeof(scratch)) == 0 && sequence == 2 && count == 2);
+    before = db;
+    assert(timelite_batches_next_range(&db, &range, output, 3, &count, &sequence,
+                                      scratch, sizeof(scratch)) == TIMELITE_END);
+    same_cursor(&db, &before);
+    range.filter_series = 1;
+    assert(timelite_batches_seek(&db, 15, scratch, sizeof(scratch)) == 0);
+    assert(timelite_batches_next_range(&db, &range, output, 1, &count, &sequence,
+                                      scratch, sizeof(scratch)) == 0);
+    assert(sequence == 1 && count == 1 && output[0].value == 3);
+    assert(timelite_batches_next_range(&db, &range, output, 1, &count, &sequence,
+                                      scratch, sizeof(scratch)) == 0);
+    assert(sequence == 2 && count == 1 && output[0].timestamp_us == 30);
+    /* Skipped batches are not published on a buffer error or END. */
+    assert(timelite_batches_rewind(&db) == 0);
+    range.from_us = 25;
+    before = db;
+    assert(timelite_batches_next_range(&db, &range, NULL, 0, &count, &sequence,
+                                      scratch, sizeof(scratch)) == TIMELITE_BUFFER_TOO_SMALL);
+    same_cursor(&db, &before);
+    assert(timelite_batches_next_range(&db, &range, output, 1, &count, &sequence,
+                                      scratch, sizeof(scratch)) == 0 && sequence == 2);
+    assert(timelite_batches_rewind(&db) == 0);
+    before = db;
+    range.series = 123;
+    assert(timelite_batches_next_range(&db, &range, output, 3, &count, &sequence,
+                                      scratch, sizeof(scratch)) == TIMELITE_END);
+    same_cursor(&db, &before);
+    TEST_CASE("query argument cursor preservation", 0);
+    assert(timelite_batches_seek(NULL, 0, scratch, sizeof(scratch)) == EINVAL);
+    assert(timelite_batches_seek(&db, 0, NULL, sizeof(scratch)) == EINVAL);
+    assert(timelite_batches_seek(&db, 0, scratch, 1343) == TIMELITE_BUFFER_TOO_SMALL);
+    assert(timelite_batches_next_range(&db, NULL, output, 3, &count, &sequence,
+                                      scratch, sizeof(scratch)) == EINVAL);
+    assert(timelite_batches_next_range(&db, &range, NULL, 3, &count, &sequence,
+                                      scratch, sizeof(scratch)) == EINVAL);
+    assert(timelite_batches_next_range(&db, &range, output, 3, NULL, &sequence,
+                                      scratch, sizeof(scratch)) == EINVAL);
+    assert(timelite_batches_next_range(&db, &range, output, 3, &count, NULL,
+                                      scratch, sizeof(scratch)) == EINVAL);
+    assert(timelite_batches_next_range(&db, &range, output, 3, &count, &sequence,
+                                      NULL, sizeof(scratch)) == EINVAL);
+    assert(timelite_batches_next_range(&db, &range, output, 3, &count, &sequence,
+                                      scratch, 1343) == TIMELITE_BUFFER_TOO_SMALL);
+    range.from_us = 42;
+    assert(timelite_batches_next_range(&db, &range, output, 3, &count, &sequence,
+                                      scratch, sizeof(scratch)) == EINVAL);
+    range.from_us = 41;
+    assert(timelite_batches_next_range(&db, &range, output, 3, &count, &sequence,
+                                      scratch, sizeof(scratch)) == TIMELITE_END);
+    range.filter_series = 2;
+    assert(timelite_batches_next_range(&db, &range, output, 3, &count, &sequence,
+                                      scratch, sizeof(scratch)) == EINVAL);
+    same_cursor(&db, &before);
+    assert(timelite_batches_close(&db) == 0);
+    assert(remove_test_file(path) == 0);
+    assert(remove_test_file(wal_path) == 0);
+}
+
+static void legacy_range(const char *path, const char *wal_path)
+{
+    /* Exact 006 golden manifest and segment; frame retained from the same
+     * unchanged 004 encoding. Pair identity comes from fresh provisioning. */
+    static const unsigned char manifest[] =
+        "TLINSTAL\1\0\0\0\0\0\0\0\x14\1\0\0\0\0\0\0\1\0\0\0\0\0\0\0"
+        "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\xf6\x94\xc8\x24";
+    static const unsigned char segment[] =
+        "TLSEGMNT\1\0\0\0\0\0\0\0\1\0\0\0\0\0\0\0\x54\0\0\0\xd6\xa4\x16\x17";
+    struct timelite_batches db;
+    struct timelite_file file = TIMELITE_FILE_INIT;
+    struct timelite_record record = {17, UINT64_C(1700000000000000), -123};
+    struct timelite_range range = {UINT64_C(1700000000000000), UINT64_MAX, 17, 1};
+    unsigned char scratch[TIMELITE_BATCH_SCRATCH], frame[84];
+    uint64_t sequence;
+    size_t count;
+    TEST_CASE("006 golden seek and append order", 0);
+    assert(sizeof(manifest) == 65 && sizeof(segment) == 33);
+    assert(timelite_batches_init(&db) == 0);
+    assert(timelite_batches_open(&db, path, wal_path, TIMELITE_CREATE_NEW,
+                                scratch, sizeof(scratch)) == 0);
+    assert(timelite_batches_append(&db, &record, 1, scratch, sizeof(scratch), &sequence) == 0);
+    assert(timelite_batches_close(&db) == 0);
+    assert(timelite_file_open(&file, wal_path) == 0);
+    assert(timelite_file_read(&file, 32, frame, 84, &count) == 0 && count == 84);
+    assert(timelite_file_truncate(&file, 32) == 0);
+    assert(timelite_file_close(&file) == 0);
+    assert(timelite_file_open(&file, path) == 0);
+    assert(timelite_file_write(&file, 96, manifest, 64, &count) == 0);
+    assert(timelite_file_write(&file, 160, segment, 32, &count) == 0);
+    assert(timelite_file_write(&file, 192, frame, 84, &count) == 0);
+    assert(timelite_file_close(&file) == 0);
+    assert(timelite_batches_open(&db, path, wal_path, TIMELITE_OPEN_EXISTING,
+                                scratch, sizeof(scratch)) == 0);
+    assert(timelite_batches_seek(&db, record.timestamp_us, scratch, sizeof(scratch)) == 0);
+    assert(timelite_batches_next_range(&db, &range, &record, 1, &count, &sequence,
+                                      scratch, sizeof(scratch)) == 0 && sequence == 1 && count == 1);
+    record.timestamp_us--;
+    assert(timelite_batches_append(&db, &record, 1, scratch, sizeof(scratch), &sequence) == TIMELITE_OUT_OF_ORDER);
+    record.timestamp_us++;
+    assert(timelite_batches_append(&db, &record, 1, scratch, sizeof(scratch), &sequence) == 0);
+    assert(timelite_batches_checkpoint(&db, scratch, sizeof(scratch)) == 0);
+    assert(timelite_batches_close(&db) == 0);
+    assert(timelite_batches_open(&db, path, wal_path, TIMELITE_OPEN_EXISTING,
+                                scratch, sizeof(scratch)) == 0);
+    assert(timelite_batches_seek(&db, record.timestamp_us, scratch, sizeof(scratch)) == 0);
+    assert(timelite_batches_next(&db, &record, 1, &count, &sequence,
+                                scratch, sizeof(scratch)) == 0 && sequence == 1);
+    assert(timelite_batches_next(&db, &record, 1, &count, &sequence,
+                                scratch, sizeof(scratch)) == 0 && sequence == 2);
+    assert(timelite_batches_seek(&db, UINT64_MAX, scratch, sizeof(scratch)) == TIMELITE_END);
+    assert(timelite_batches_close(&db) == 0);
+    assert(remove_test_file(path) == 0);
+    assert(remove_test_file(wal_path) == 0);
+}
+
 int main(void)
 {
 #if defined(_WIN32)
@@ -107,10 +311,10 @@ int main(void)
     struct timelite_db legacy;
     struct timelite_file file = TIMELITE_FILE_INIT;
     struct timelite_record input[2] = {{0, UINT64_MAX, INT64_MIN},
-                                     {UINT32_MAX, 0, INT64_MAX}};
+                                     {UINT32_MAX, UINT64_MAX, INT64_MAX}};
     struct timelite_record output[2];
     unsigned char scratch[TIMELITE_BATCH_SCRATCH];
-    unsigned char saved[240], installed[304], damaged;
+    unsigned char saved[240], installed[336], damaged;
     uint64_t sequence = 99, size;
     size_t count = 99, transferred, prefix;
     int error, skipped = 0;
@@ -222,12 +426,12 @@ int main(void)
                                 scratch, sizeof(scratch)) == 0);
     assert(timelite_batches_checkpoint(&db, scratch, sizeof(scratch)) == 0);
     assert(timelite_file_open(&file, path) == 0);
-    assert(timelite_file_size(&file, &size) == 0 && size == 160 + 32 + 208);
+    assert(timelite_file_size(&file, &size) == 0 && size == 160 + 64 + 208);
     assert(timelite_file_read(&file, 96, installed, sizeof(installed), &transferred) == 0);
     assert(transferred == sizeof(installed));
-    assert(memcmp(installed, "TLINSTAL\1\0\0\0\0\0\0\0\x90\1\0\0\0\0\0\0\2\0\0\0\0\0\0\0", 32) == 0);
-    assert(memcmp(installed + 64, "TLSEGMNT\1\0\0\0\0\0\0\0\2\0\0\0\0\0\0\0\xd0\0\0\0", 28) == 0);
-    assert(memcmp(installed + 96, saved + 32, 208) == 0);
+    assert(memcmp(installed, "TLINSTAL\1\0\0\0\0\0\0\0\xb0\1\0\0\0\0\0\0\2\0\0\0\0\0\0\0", 32) == 0);
+    assert(memcmp(installed + 64, "TLSPAN07\1\0\0\0\0\0\0\0\2\0\0\0\0\0\0\0\xd0\0\0\0", 28) == 0);
+    assert(memcmp(installed + 128, saved + 32, 208) == 0);
     assert(timelite_file_close(&file) == 0);
     assert(timelite_file_open(&file, wal_path) == 0);
     assert(timelite_file_size(&file, &size) == 0 && size == 32);
@@ -281,7 +485,7 @@ int main(void)
     assert(timelite_file_close(&file) == 0);
     assert(remove_test_file(path) == 0);
     assert(remove_test_file(wal_path) == 0);
-    /* Fresh pair with one installed single-record frame (276-byte database).
+    /* Fresh pair with one installed single-record frame (308-byte database).
      * Bit flips: slot 0 (older manifest) still opens; slot 1 and the segment
      * header fail closed at open; the installed frame fails closed at read. */
     assert(timelite_batches_open(&db, path, wal_path, TIMELITE_CREATE_NEW,
@@ -290,19 +494,19 @@ int main(void)
     assert(timelite_batches_checkpoint(&db, scratch, sizeof(scratch)) == 0);
     assert(timelite_batches_close(&db) == 0);
     assert(timelite_file_open(&file, path) == 0);
-    assert(timelite_file_read(&file, 0, installed, 276, &transferred) == 0 && transferred == 276);
+    assert(timelite_file_read(&file, 0, installed, 308, &transferred) == 0 && transferred == 308);
     assert(timelite_file_close(&file) == 0);
-    for (prefix = 32; prefix < 276; prefix++)
+    for (prefix = 32; prefix < 308; prefix++)
     {
         TEST_CASE("installed byte flip", prefix);
         assert(timelite_file_open(&file, path) == 0);
-        assert(timelite_file_write(&file, 0, installed, 276, &transferred) == 0);
+        assert(timelite_file_write(&file, 0, installed, 308, &transferred) == 0);
         damaged = (unsigned char)(installed[prefix] ^ 1);
         assert(timelite_file_write(&file, prefix, &damaged, 1, &transferred) == 0);
         assert(timelite_file_close(&file) == 0);
         error = timelite_batches_open(&db, path, wal_path, TIMELITE_OPEN_EXISTING,
                                       scratch, sizeof(scratch));
-        if (prefix >= 96 && prefix < 192)
+        if (prefix >= 96 && prefix < 224)
         {
             assert(error == TIMELITE_INVALID_DATABASE);
             continue;
@@ -313,14 +517,24 @@ int main(void)
                                       scratch, sizeof(scratch));
         assert(error == (prefix < 96 ? 0 : TIMELITE_INVALID_DATABASE));
         assert(count == (prefix < 96 ? 1 : 99));
+        if (prefix >= 224)
+        {
+            struct timelite_batches before = db;
+            struct timelite_range range = {0, UINT64_MAX, 0, 0};
+            assert(timelite_batches_seek(&db, 0, scratch, sizeof(scratch)) == TIMELITE_INVALID_DATABASE);
+            assert(timelite_batches_next_range(&db, &range, output, 2, &count, &sequence,
+                                              scratch, sizeof(scratch)) == TIMELITE_INVALID_DATABASE);
+            same_cursor(&db, &before);
+            assert(count == 99);
+        }
         assert(timelite_batches_close(&db) == 0);
     }
     /* Database cut below data_end with an empty WAL fails closed. */
-    for (prefix = 161; prefix < 276; prefix++)
+    for (prefix = 161; prefix < 308; prefix++)
     {
         TEST_CASE("database cut", prefix);
         assert(timelite_file_open(&file, path) == 0);
-        assert(timelite_file_write(&file, 0, installed, 276, &transferred) == 0);
+        assert(timelite_file_write(&file, 0, installed, 308, &transferred) == 0);
         assert(timelite_file_truncate(&file, prefix) == 0);
         assert(timelite_file_close(&file) == 0);
         assert(timelite_batches_open(&db, path, wal_path, TIMELITE_OPEN_EXISTING,
@@ -329,7 +543,7 @@ int main(void)
     /* Capacity: a sparse fixture with 16 segments ending 100 bytes below the
      * limit. Checkpoint refuses before any effect; append and close still work. */
     assert(timelite_file_open(&file, path) == 0);
-    assert(timelite_file_write(&file, 0, installed, 276, &transferred) == 0);
+    assert(timelite_file_write(&file, 0, installed, 308, &transferred) == 0);
     error = capacity_fixture(&file, installed);
     assert(timelite_file_close(&file) == 0);
     if (error == 0)
@@ -357,6 +571,8 @@ int main(void)
     }
     assert(remove_test_file(path) == 0);
     assert(remove_test_file(wal_path) == 0);
+    time_ranges(path, wal_path);
+    legacy_range(path, wal_path);
     assert(timelite_init(&legacy) == 0);
     assert(timelite_open(&legacy, path, TIMELITE_CREATE_NEW) == 0);
     assert(timelite_close(&legacy) == 0);

@@ -4,12 +4,13 @@
 
 Timelite is a small embedded time-series database project written in C99.
 The code implements v1 lifecycle plus a separate v2 durable sensor batch API,
-with a paired WAL, recovery, sequential batch reading and explicit checkpointing
+with a paired WAL, recovery, sequential and time-range reading (feature 007),
+globally ordered append, indexed segment seek and explicit checkpointing
 (feature 006): committed WAL batches are installed into the main database file
 as immutable segments behind a two-slot generation manifest, and the WAL is
 truncated only after that install is durable. The WAL is capped at 64 MiB and
 the main file at 1 GiB; checkpoint is manual and never automatic. Feature 005 is
-the repeatable testing suite. Retention, compaction, indexes and queries remain
+the repeatable testing suite. Retention, compaction, per-series indexes and aggregation remain
 deferred.
 Batch operations use caller-owned scratch, integer records and serialized ownership.
 Durable provisioning is implemented for selected local Linux/macOS filesystems;

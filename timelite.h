@@ -72,6 +72,7 @@ const char *timelite_version(void);
 #define TIMELITE_WAL_FULL (-6)
 #define TIMELITE_PAIR_MISMATCH (-7)
 #define TIMELITE_DATABASE_FULL (-8)
+#define TIMELITE_OUT_OF_ORDER (-9)
 
 struct timelite_record
 {
@@ -97,6 +98,14 @@ struct timelite_batches
     uint64_t private_installed;
     uint64_t private_generation;
     uint64_t private_segment_end;
+    uint64_t private_last_time;
+    uint64_t private_installed_time;
+    uint64_t private_wal_first_time;
+    uint64_t private_wal_minimum;
+    uint64_t private_wal_maximum;
+    uint64_t private_last_segment;
+    uint64_t private_span_start;
+    int private_wal_ordered;
     int private_in_wal;
     int private_legacy;
     int private_failed;
@@ -115,7 +124,10 @@ int timelite_batches_open(struct timelite_batches *db, const char *database_path
                           const char *wal_path, enum timelite_open_mode mode,
                           void *scratch, size_t scratch_size);
 /* 1..64 records, all integer values valid, caller chooses value units. Timestamps
- * are unsigned microseconds since Unix epoch. Order and duplicates preserved.
+ * are unsigned microseconds since Unix epoch. Times must be non-decreasing
+ * within and across batches, globally across all series. Equal times allowed.
+ * OUT_OF_ORDER rejects before I/O with no effect. Global order gives segment
+ * spans without per-series state. Existing legacy records are not reordered.
  * Sequence output written only on durable success. Argument/capacity errors are
  * harmless; any write/sync failure requires close/reopen before reads or appends.
  * Failed append may commit; enumerate after reopen to reconcile, no exactly-once
@@ -147,6 +159,32 @@ int timelite_batches_next(struct timelite_batches *db,
                           struct timelite_record *records, size_t capacity,
                           size_t *count, uint64_t *sequence,
                           void *scratch, size_t scratch_size);
+/* Caller-owned, not retained. Half-open interval; filter_series must be 0 or 1.
+ * from_us > until_us is EINVAL; equal endpoints give END. */
+struct timelite_range
+{
+    uint64_t from_us;
+    uint64_t until_us;
+    uint32_t series;
+    int filter_series;
+};
+
+/* Position at first batch whose last record time is >= from_us. Indexed spans
+ * skip installed segments; legacy segments and WAL use linear reads. No writes.
+ * Errors leave cursor unchanged; END positions at current end. Scratch and
+ * closed/poisoned handle rules are the same as next. */
+int timelite_batches_seek(struct timelite_batches *db, uint64_t from_us,
+                          void *scratch, size_t scratch_size);
+/* Return matching records from one batch, skipping batches with no matches.
+ * Shares next/seek/rewind cursor. Capacity counts matching records only.
+ * Errors and END leave all outputs and cursor unchanged; scratch may change.
+ * BUFFER_TOO_SMALL can be retried at the same cursor. No filter is retained.
+ * Legacy unordered records are scanned without assuming a time bound. */
+int timelite_batches_next_range(struct timelite_batches *db,
+                                const struct timelite_range *range,
+                                struct timelite_record *records, size_t capacity,
+                                size_t *count, uint64_t *sequence,
+                                void *scratch, size_t scratch_size);
 int timelite_batches_rewind(struct timelite_batches *db);
 /* Consumes both resources even if one close fails; returns first error. */
 int timelite_batches_close(struct timelite_batches *db);
