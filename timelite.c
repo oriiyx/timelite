@@ -300,6 +300,9 @@ int timelite_batches_init(struct timelite_batches *db)
     db->private_data_end = TIMELITE_DATA_START;
     db->private_installed = 0;
     db->private_generation = 0;
+    db->private_revision = 0;
+    db->private_live_batches = 0;
+    db->private_retention = 0;
     db->private_last_time = 0;
     db->private_installed_time = 0;
     db->private_wal_first_time = 0;
@@ -406,6 +409,76 @@ static int check_manifest(const unsigned char *m, uint64_t size,
     *data_end = d;
     *last = l;
     return 1;
+}
+
+/* Retention revisions are independent of the surviving segment count.
+ * Phase 1 discards an unfinished tail, 2 copies the tail back, 3 truncates. */
+struct retention_state
+{
+    uint64_t revision, root;
+    unsigned int phase;
+    int enabled;
+};
+
+static void encode_retention(unsigned char *m, uint64_t revision,
+                              uint64_t count, uint64_t end, uint64_t last,
+                              uint64_t time, uint64_t tail, uint64_t root,
+                              unsigned int phase)
+{
+    memset(m, 0, 64);
+    memcpy(m, "TLRETAIN", 8);
+    encode64(m + 8, revision);
+    encode64(m + 16, end);
+    encode64(m + 24, last);
+    encode64(m + 32, time);
+    encode32(m + 40, (uint32_t)tail);
+    encode32(m + 44, (uint32_t)root);
+    encode32(m + 48, 10);
+    encode32(m + 52, (uint32_t)count);
+    encode32(m + 56, phase);
+    encode32(m + 60, checksum(m, 60));
+}
+
+static int retention_manifest(const unsigned char *m, uint64_t size)
+{
+    uint64_t end = decode64(m + 16), root = decode32(m + 44);
+    uint64_t count = decode32(m + 52), tail = decode32(m + 40);
+    unsigned int phase = decode32(m + 56);
+    return memcmp(m, "TLRETAIN", 8) == 0 &&
+           checksum(m, 60) == decode32(m + 60) && decode32(m + 48) == 10 &&
+           decode64(m + 8) != 0 && phase <= 3 && root >= 160 &&
+           root <= end && end <= size && end <= TIMELITE_DATABASE_CAPACITY &&
+           count <= (end - root) / TIMELITE_SEGMENT_MIN &&
+           count <= decode64(m + 24) &&
+           (count != 0 ? tail >= root && tail < end : tail == 0 && root == end) &&
+           (phase == 2 ? end - root <= root - 160 : root == 160);
+}
+
+static int publish_retention(struct timelite_file *file,
+                              struct retention_state *state, uint64_t count,
+                              uint64_t end, uint64_t last, uint64_t time,
+                              uint64_t tail, uint64_t root, unsigned int phase)
+{
+    unsigned char m[64];
+    int error;
+    if (state->revision == UINT64_MAX)
+    {
+        return EOVERFLOW;
+    }
+    encode_retention(m, state->revision + 1, count, end, last, time, tail, root, phase);
+    error = write_exact(file, 32 + 64 * ((state->revision + 1) & 1), m, 64);
+    if (error == 0)
+    {
+        error = timelite_file_sync(file);
+    }
+    if (error == 0)
+    {
+        state->revision++;
+        state->root = root;
+        state->phase = phase;
+        state->enabled = 1;
+    }
+    return error;
 }
 
 /* The body is a verbatim copy of validated WAL frames. */
@@ -670,12 +743,15 @@ int timelite_batches_close(struct timelite_batches *db)
  * 160 bytes is empty (an install always leaves more), anything larger fails. */
 static int read_manifests(struct timelite_file *database, uint64_t size, int *legacy,
                           uint64_t *generation, uint64_t *data_end, uint64_t *last,
-                          uint64_t *last_time, uint64_t *tail, int *has_time)
+                          uint64_t *last_time, uint64_t *tail, int *has_time,
+                          struct retention_state *state)
 {
     unsigned char slot[64];
-    uint64_t g, d, l;
+    uint64_t g, d, l, revision;
     size_t count;
     int index, found = 0, error;
+    memset(state, 0, sizeof(*state));
+    state->root = 160;
     *legacy = size == 32;
     *generation = 0;
     *data_end = TIMELITE_DATA_START;
@@ -692,20 +768,37 @@ static int read_manifests(struct timelite_file *database, uint64_t size, int *le
         {
             return error;
         }
-        if (count != sizeof(slot) || !check_manifest(slot, size, &g, &d, &l) ||
-            (g & 1) != (uint64_t)index)
+        if (count != sizeof(slot))
         {
             continue;
         }
-        /* Slot parity makes two valid generations always differ. */
-        if (!found || g > *generation)
+        revision = decode64(slot + 8);
+        if ((revision & 1) != (uint64_t)index)
+        {
+            continue;
+        }
+        if (retention_manifest(slot, size))
+        {
+            g = decode32(slot + 52);
+            d = decode64(slot + 16);
+            l = decode64(slot + 24);
+        }
+        else if (!check_manifest(slot, size, &g, &d, &l))
+        {
+            continue;
+        }
+        if (!found || revision > state->revision)
         {
             *generation = g;
             *data_end = d;
             *last = l;
             *last_time = decode64(slot + 32);
-            *tail = decode64(slot + 40);
-            *has_time = decode32(slot + 48) == 7;
+            state->enabled = memcmp(slot, "TLRETAIN", 8) == 0;
+            state->revision = revision;
+            state->root = state->enabled ? decode32(slot + 44) : 160;
+            state->phase = state->enabled ? decode32(slot + 56) : 0;
+            *tail = state->enabled ? decode32(slot + 40) : decode64(slot + 40);
+            *has_time = state->enabled || decode32(slot + 48) == 7;
         }
         found = 1;
     }
@@ -721,15 +814,17 @@ static int read_manifests(struct timelite_file *database, uint64_t size, int *le
 static int check_segments(struct timelite_file *database, uint64_t generation,
                           uint64_t data_end, uint64_t last, uint64_t *tail,
                           uint64_t *last_time, int has_time, uint64_t *span_start,
-                          void *scratch)
+                          void *scratch, const struct retention_state *state,
+                          uint64_t *live)
 {
     struct segment_info segment;
     uint64_t offsets[24] = {0};
-    uint64_t offset = TIMELITE_DATA_START, previous = 0, sequence = 0, n;
+    uint64_t offset = state->root, previous = 0, sequence = 0, n;
     uint64_t prior_max = 0, frame, frame_sequence;
     size_t length, records;
     unsigned int bit, j;
     int error;
+    *live = 0;
     *span_start = 1;
     for (n = 1; n <= generation; n++)
     {
@@ -738,7 +833,8 @@ static int check_segments(struct timelite_file *database, uint64_t generation,
         {
             return error;
         }
-        if (sequence == UINT64_MAX || segment.first != sequence + 1)
+        if (sequence == UINT64_MAX || segment.first <= sequence ||
+            (!state->enabled && segment.first != sequence + 1))
         {
             return TIMELITE_INVALID_DATABASE;
         }
@@ -773,17 +869,19 @@ static int check_segments(struct timelite_file *database, uint64_t generation,
             offsets[j] = offset;
         }
         previous = offset;
+        *live += segment.last - segment.first + 1;
         sequence = segment.last;
         offset += segment.header_size + segment.body;
     }
-    if (offset != data_end || sequence != last || (has_time && *tail != previous))
+    if (offset != data_end || sequence > last ||
+        (!state->enabled && sequence != last) || (has_time && *tail != previous))
     {
         return TIMELITE_INVALID_DATABASE;
     }
     *tail = previous;
     if (generation != 0)
     {
-        if (segment.ordered)
+        if (segment.ordered && !state->enabled)
         {
             if (has_time && *last_time != segment.maximum)
             {
@@ -813,6 +911,169 @@ static int check_segments(struct timelite_file *database, uint64_t generation,
     return 0;
 }
 
+/* Legacy spans are unknown; inspect every validated record before deleting. */
+static int segment_expires(struct timelite_file *file, uint64_t offset,
+                            const struct segment_info *segment, uint64_t cutoff,
+                            void *scratch, int *expires)
+{
+    uint64_t position = offset + segment->header_size;
+    uint64_t end = position + segment->body, sequence = segment->first;
+    size_t length, records, i;
+    int error;
+    *expires = segment->maximum < cutoff;
+    if (segment->header_size == 64 || cutoff == 0)
+    {
+        return 0;
+    }
+    *expires = 1;
+    while (position < end)
+    {
+        error = read_frame(file, position, end, sequence, scratch, &length, &records);
+        if (error != 0)
+        {
+            return error == TIMELITE_END ? TIMELITE_INVALID_DATABASE : error;
+        }
+        for (i = 0; i < records; i++)
+        {
+            if (decode64((unsigned char *)scratch + 36 + i * 20) >= cutoff)
+            {
+                *expires = 0;
+            }
+        }
+        position += length;
+        sequence++;
+    }
+    return sequence - 1 == segment->last ? 0 : TIMELITE_INVALID_DATABASE;
+}
+
+/* Source and destination extents never overlap. Preserve legacy header sizes
+ * so a retained copy cannot be larger than its original set. */
+static int copy_segments(struct timelite_file *file, uint64_t root, uint64_t end,
+                           uint64_t destination, int filter, uint64_t cutoff,
+                           void *scratch, uint64_t *new_end, uint64_t *new_tail)
+{
+    struct segment_info segment;
+    unsigned char header[64];
+    uint64_t offsets[24] = {0};
+    uint64_t offset = root, previous = 0, n = 0, position, bound, sequence;
+    size_t length, records;
+    unsigned int bit, j;
+    int error, expires;
+    while (offset < end)
+    {
+        error = read_segment(file, offset, end, &segment);
+        if (error != 0)
+        {
+            return error;
+        }
+        expires = 0;
+        if (filter)
+        {
+            error = segment_expires(file, offset, &segment, cutoff, scratch, &expires);
+            if (error != 0)
+            {
+                return error;
+            }
+        }
+        if (!expires)
+        {
+            n++;
+            for (bit = 0; (UINT64_C(1) << bit) != low_bit(n); bit++)
+            {
+                /* Capacity bounds this table to 24 entries. */
+            }
+            error = read_exact(file, offset, header, segment.header_size);
+            if (error != 0)
+            {
+                return error;
+            }
+            if (segment.header_size == 64)
+            {
+                encode64(header + 44, previous);
+                encode64(header + 52, offsets[bit]);
+                encode32(header + 60, checksum(header, 60));
+            }
+            error = write_exact(file, destination, header, segment.header_size);
+            if (error != 0)
+            {
+                return error;
+            }
+            for (j = 0; j <= bit; j++)
+            {
+                offsets[j] = destination;
+            }
+            previous = destination;
+            destination += segment.header_size;
+            position = offset + segment.header_size;
+            bound = position + segment.body;
+            sequence = segment.first;
+            while (position < bound)
+            {
+                error = read_frame(file, position, bound, sequence, scratch, &length, &records);
+                if (error != 0)
+                {
+                    return error == TIMELITE_END ? TIMELITE_INVALID_DATABASE : error;
+                }
+                error = write_exact(file, destination, scratch, length);
+                if (error != 0)
+                {
+                    return error;
+                }
+                position += length;
+                destination += length;
+                sequence++;
+            }
+            if (sequence - 1 != segment.last)
+            {
+                return TIMELITE_INVALID_DATABASE;
+            }
+        }
+        offset += segment.header_size + segment.body;
+    }
+    *new_end = destination;
+    *new_tail = previous;
+    return timelite_file_sync(file);
+}
+
+static int finish_retention(struct timelite_file *file, struct retention_state *state,
+                             uint64_t count, uint64_t *end, uint64_t last,
+                             uint64_t time, uint64_t *tail, void *scratch)
+{
+    uint64_t new_end, new_tail;
+    int error;
+    if (state->revision > UINT64_MAX - 2)
+    {
+        return EOVERFLOW;
+    }
+    if (state->phase == 2)
+    {
+        error = copy_segments(file, state->root, *end, 160, 0, 0,
+                              scratch, &new_end, &new_tail);
+        if (error == 0)
+        {
+            error = publish_retention(file, state, count, new_end, last, time,
+                                       new_tail, 160, 3);
+        }
+        if (error != 0)
+        {
+            return error;
+        }
+        *end = new_end;
+        *tail = new_tail;
+    }
+    /* Keep an empty retained database distinguishable from legacy empty files. */
+    error = timelite_file_truncate(file, *end == 160 ? 161 : *end);
+    if (error == 0)
+    {
+        error = timelite_file_sync(file);
+    }
+    if (error == 0)
+    {
+        error = publish_retention(file, state, count, *end, last, time, *tail, 160, 0);
+    }
+    return error;
+}
+
 int timelite_batches_open(struct timelite_batches *db, const char *database_path,
                           const char *wal_path, enum timelite_open_mode mode,
                           void *scratch, size_t scratch_size)
@@ -824,7 +1085,8 @@ int timelite_batches_open(struct timelite_batches *db, const char *database_path
     uint64_t generation = 0, data_end = TIMELITE_DATA_START, installed = 0;
     size_t length, records;
     uint64_t last_time = 0, tail = 0, span_start = 1, wal_first = 0, wal_last = 0;
-    uint64_t installed_time, wal_minimum = 0, wal_maximum = 0;
+    uint64_t installed_time, wal_minimum = 0, wal_maximum = 0, live = 0;
+    struct retention_state retention;
     size_t i;
     int has_time = 0, wal_ordered = 1;
     int create = 0, legacy = 0, stale = 0;
@@ -927,12 +1189,12 @@ int timelite_batches_open(struct timelite_batches *db, const char *database_path
     if (error == 0)
     {
         error = read_manifests(&database, database_size, &legacy, &generation,
-                               &data_end, &installed, &last_time, &tail, &has_time);
+                               &data_end, &installed, &last_time, &tail, &has_time, &retention);
     }
     if (error == 0)
     {
         error = check_segments(&database, generation, data_end, installed,
-                               &tail, &last_time, has_time, &span_start, scratch);
+                               &tail, &last_time, has_time, &span_start, scratch, &retention, &live);
     }
     if (error == 0)
     {
@@ -1013,7 +1275,9 @@ int timelite_batches_open(struct timelite_batches *db, const char *database_path
         error = TIMELITE_INVALID_DATABASE;
         goto fail;
     }
-    if (database_size > data_end && (stale || sequence == installed))
+    if (database_size > data_end && retention.phase == 0 &&
+        !(retention.enabled && generation == 0 && database_size == 161) &&
+        (stale || sequence == installed))
     {
         /* Bytes beyond data_end come only from an interrupted install, whose
          * frames are still in the WAL. Without such frames the newest manifest
@@ -1036,6 +1300,11 @@ int timelite_batches_open(struct timelite_batches *db, const char *database_path
     {
         error = timelite_file_provision(&wal, wal_path);
     }
+    if (error == 0 && retention.phase != 0)
+    {
+        error = finish_retention(&database, &retention, generation, &data_end,
+                                 installed, installed_time, &tail, scratch);
+    }
     if (error == 0 && offset < size)
     {
         error = timelite_file_truncate(&wal, offset);
@@ -1055,6 +1324,9 @@ int timelite_batches_open(struct timelite_batches *db, const char *database_path
     db->private_data_end = data_end;
     db->private_installed = installed;
     db->private_generation = generation;
+    db->private_revision = retention.revision;
+    db->private_retention = retention.enabled;
+    db->private_live_batches = live;
     db->private_last_time = last_time;
     db->private_installed_time = installed_time;
     db->private_last_segment = tail;
@@ -1106,8 +1378,9 @@ int timelite_batches_get_status(struct timelite_batches *db,
     {
         return error;
     }
-    status->committed_batches = db->private_sequence;
-    status->installed_batches = db->private_installed;
+    status->committed_batches = db->private_live_batches +
+                                (db->private_sequence - db->private_installed);
+    status->installed_batches = db->private_live_batches;
     status->pending_batches = db->private_sequence - db->private_installed;
     status->installed_segments = db->private_generation;
     status->wal_bytes = db->private_end;
@@ -1225,7 +1498,7 @@ int timelite_batches_checkpoint(struct timelite_batches *db,
 {
     unsigned char header[128];
     struct timelite_file database, wal;
-    uint64_t body, data_end, offset = 32, sequence, skip = 0, target;
+    uint64_t body, data_end, offset = 32, sequence, skip = 0, target, prior_max;
     struct segment_info segment;
     size_t length = 0, records, header_size;
     int error = batch_ready(db);
@@ -1245,9 +1518,14 @@ int timelite_batches_checkpoint(struct timelite_batches *db,
     {
         return 0;
     }
+    prior_max = db->private_installed_time;
     body = db->private_end - 32;
     data_end = db->private_data_end;
     header_size = 64;
+    if (db->private_revision == UINT64_MAX)
+    {
+        return EOVERFLOW;
+    }
     if (body + header_size > TIMELITE_DATABASE_CAPACITY - data_end)
     {
         return TIMELITE_DATABASE_FULL;
@@ -1263,6 +1541,15 @@ int timelite_batches_checkpoint(struct timelite_batches *db,
         {
             return error;
         }
+    }
+    if (db->private_retention && db->private_generation != 0)
+    {
+        error = read_segment(&database, db->private_last_segment, data_end, &segment);
+        if (error != 0)
+        {
+            return error;
+        }
+        prior_max = segment.maximum;
     }
     /* Set before the first effect, exactly like append. */
     db->private_failed = 1;
@@ -1316,10 +1603,18 @@ int timelite_batches_checkpoint(struct timelite_batches *db,
      * its sync is the install point. */
     if (error == 0)
     {
-        encode_manifest(header, db->private_generation + 1, data_end + header_size + body,
-                        sequence, db->private_last_time, data_end);
-        error = write_exact(&database, 32 + 64 * ((db->private_generation + 1) & 1),
-                            header, 64);
+        if (db->private_retention)
+        {
+            encode_retention(header, db->private_revision + 1, db->private_generation + 1,
+                             data_end + header_size + body, sequence,
+                             db->private_last_time, data_end, 160, 0);
+        }
+        else
+        {
+            encode_manifest(header, db->private_generation + 1, data_end + header_size + body,
+                            sequence, db->private_last_time, data_end);
+        }
+        error = write_exact(&database, 32 + 64 * ((db->private_revision + 1) & 1), header, 64);
     }
     if (error == 0)
     {
@@ -1329,12 +1624,14 @@ int timelite_batches_checkpoint(struct timelite_batches *db,
     {
         return error;
     }
-    if (db->private_wal_first_time < db->private_installed_time)
+    if (db->private_wal_first_time < prior_max)
     {
         db->private_span_start = db->private_generation + 1;
     }
     db->private_installed_time = db->private_last_time;
     db->private_generation++;
+    db->private_revision++;
+    db->private_live_batches += sequence - db->private_installed;
     db->private_data_end = data_end + header_size + body;
     db->private_last_segment = data_end;
     if (!db->private_wal_ordered)
@@ -1382,7 +1679,7 @@ static int read_cursor(struct timelite_batches *db, void *scratch,
 {
     struct timelite_file file;
     unsigned char *bytes = scratch;
-    uint64_t cursor, segment_end;
+    uint64_t cursor, segment_end, expected = db->private_read_sequence;
     struct segment_info segment;
     size_t length, found;
     int in_wal, error;
@@ -1394,6 +1691,7 @@ static int read_cursor(struct timelite_batches *db, void *scratch,
     {
         in_wal = 1;
         cursor = 32;
+        expected = db->private_installed + 1;
     }
     if (in_wal)
     {
@@ -1402,7 +1700,7 @@ static int read_cursor(struct timelite_batches *db, void *scratch,
             return TIMELITE_END;
         }
         file = batch_file(db, 1);
-        error = read_frame(&file, cursor, db->private_end, db->private_read_sequence,
+        error = read_frame(&file, cursor, db->private_end, expected,
                            bytes, &length, &found);
     }
     else
@@ -1415,15 +1713,17 @@ static int read_cursor(struct timelite_batches *db, void *scratch,
             {
                 return error;
             }
-            if (segment.first != db->private_read_sequence)
+            if (segment.first != expected &&
+                (!db->private_retention || segment.first < expected))
             {
                 return TIMELITE_INVALID_DATABASE;
             }
+            expected = segment.first;
             cursor += segment.header_size;
             segment_end = cursor + segment.body;
         }
         /* Installed segments are complete: a frame that does not fit is damage. */
-        error = read_frame(&file, cursor, segment_end, db->private_read_sequence,
+        error = read_frame(&file, cursor, segment_end, expected,
                            bytes, &length, &found);
         if (error == TIMELITE_END)
         {
@@ -1435,11 +1735,11 @@ static int read_cursor(struct timelite_batches *db, void *scratch,
         return error;
     }
     *count = found;
-    *sequence = db->private_read_sequence;
+    *sequence = expected;
     db->private_in_wal = in_wal;
     db->private_cursor = cursor + length;
     db->private_segment_end = segment_end;
-    db->private_read_sequence++;
+    db->private_read_sequence = expected + 1;
     return 0;
 }
 
@@ -1456,6 +1756,128 @@ static int read_arguments(struct timelite_batches *db, void *scratch,
         return EINVAL;
     }
     return scratch_size < TIMELITE_BATCH_SCRATCH ? TIMELITE_BUFFER_TOO_SMALL : 0;
+}
+
+int timelite_batches_expire_before(struct timelite_batches *db, uint64_t cutoff_us,
+                                   void *scratch, size_t scratch_size)
+{
+    struct timelite_file file;
+    struct segment_info segment;
+    struct retention_state state;
+    struct timelite_batches cursor, next;
+    uint64_t offset = 160, bytes = 0, segments = 0, live = 0;
+    uint64_t end, tail, wanted, ignored, span;
+    size_t records;
+    int expires, error = read_arguments(db, scratch, scratch_size);
+    if (error != 0)
+    {
+        return error;
+    }
+    file = batch_file(db, 0);
+    while (offset < db->private_data_end)
+    {
+        error = read_segment(&file, offset, db->private_data_end, &segment);
+        if (error == 0)
+        {
+            error = segment_expires(&file, offset, &segment, cutoff_us, scratch, &expires);
+        }
+        if (error != 0)
+        {
+            return error;
+        }
+        if (!expires)
+        {
+            bytes += segment.header_size + segment.body;
+            segments++;
+            live += segment.last - segment.first + 1;
+        }
+        offset += segment.header_size + segment.body;
+    }
+    if (segments == db->private_generation)
+    {
+        return 0;
+    }
+    if (bytes > TIMELITE_DATABASE_CAPACITY - db->private_data_end)
+    {
+        return TIMELITE_DATABASE_FULL;
+    }
+    if (db->private_revision > UINT64_MAX - 5)
+    {
+        return EOVERFLOW;
+    }
+    state.revision = db->private_revision;
+    state.root = 160;
+    state.phase = 0;
+    state.enabled = db->private_retention;
+    wanted = db->private_read_sequence;
+    db->private_failed = 1;
+    error = publish_retention(&file, &state, db->private_generation,
+                               db->private_data_end, db->private_installed,
+                               db->private_installed_time, db->private_last_segment, 160, 1);
+    if (error == 0)
+    {
+        error = copy_segments(&file, 160, db->private_data_end, db->private_data_end,
+                               1, cutoff_us, scratch, &end, &tail);
+    }
+    if (error == 0)
+    {
+        error = publish_retention(&file, &state, segments, end, db->private_installed,
+                                   db->private_installed_time, tail, db->private_data_end, 2);
+    }
+    if (error == 0)
+    {
+        error = finish_retention(&file, &state, segments, &end, db->private_installed,
+                                  db->private_installed_time, &tail, scratch);
+    }
+    if (error != 0)
+    {
+        return error;
+    }
+    cursor = *db;
+    cursor.private_generation = segments;
+    cursor.private_revision = state.revision;
+    cursor.private_retention = 1;
+    cursor.private_live_batches = live;
+    cursor.private_data_end = end;
+    cursor.private_last_segment = tail;
+    error = check_segments(&file, segments, end, cursor.private_installed, &tail,
+                             &cursor.private_installed_time, 1, &span, scratch, &state, &live);
+    if (error != 0)
+    {
+        return error;
+    }
+    cursor.private_span_start = span;
+    reset_cursor(&cursor);
+    /* Locate the original next sequence, or the first surviving successor.
+     * Borrowed cursors never acquire or release file ownership. */
+    for (;;)
+    {
+        if (wanted == 0)
+        {
+            error = TIMELITE_END;
+            break;
+        }
+        next = cursor;
+        error = read_cursor(&next, scratch, &records, &ignored);
+        if (error == TIMELITE_END || (error == 0 && ignored >= wanted))
+        {
+            break;
+        }
+        if (error != 0)
+        {
+            return error;
+        }
+        cursor = next;
+    }
+    if (error == TIMELITE_END)
+    {
+        cursor.private_in_wal = 1;
+        cursor.private_cursor = cursor.private_end;
+        cursor.private_read_sequence = cursor.private_sequence + 1;
+    }
+    cursor.private_failed = 0;
+    *db = cursor;
+    return 0;
 }
 
 static void copy_cursor(struct timelite_batches *destination,
@@ -1654,7 +2076,7 @@ int timelite_batches_next_range(struct timelite_batches *db,
     struct timelite_batches cursor;
     struct timelite_file file;
     struct segment_info segment;
-    uint64_t batch, offset, ordered_sequence;
+    uint64_t batch, offset, ordered_sequence, first_ordered;
     size_t found, matches, i;
     int error = batch_ready(db);
     if (error != 0)
@@ -1692,10 +2114,20 @@ int timelite_batches_next_range(struct timelite_batches *db,
             {
                 return error;
             }
-            /* A legacy WAL can start below the installed maximum. */
-            if (db->private_end == 32 || db->private_wal_first_time >= db->private_installed_time)
+            first_ordered = segment.first;
+            if (db->private_retention && db->private_end != 32)
             {
-                ordered_sequence = segment.first;
+                error = read_segment(&file, db->private_last_segment, db->private_data_end, &segment);
+                if (error != 0)
+                {
+                    return error;
+                }
+            }
+            /* A legacy WAL can start below the installed maximum. */
+            if (db->private_end == 32 || db->private_wal_first_time >=
+                (db->private_retention ? segment.maximum : db->private_installed_time))
+            {
+                ordered_sequence = first_ordered;
             }
         }
     }

@@ -26,10 +26,12 @@ global timestamp order, segment seek and filtered time-range reads (feature 007)
 manual checkpointing with safe WAL reclamation (feature 006: segments behind a
 two-slot generation manifest, WAL truncated only after the install is durable).
 Feature 009 adds time-range count/minimum/maximum aggregation independent of
-the read cursor. Feature 005 is the repeatable testing suite. Keep the internal native file layer
+the read cursor. Feature 010 adds explicit whole-segment retention with durable
+tail/front copies, recovery phases and preserved sequence/timestamp high-water
+marks. Feature 005 is the repeatable testing suite. Keep the internal native file layer
 separate from public APIs.
 Preserve Windows library/backend tests and the batch model; Windows namespace
 provisioning is unsupported and must return ENOTSUP without a weaker fallback.
-Use AGENTS.md, feature 004, feature 006 and feature 007 for the qualified durability, memory,
+Use AGENTS.md, feature 004, feature 006, feature 007 and feature 010 for the qualified durability, memory,
 ownership and checkpoint contracts. Never treat an in-place overwrite as atomic. Link exactly one native backend. Report physical-device, Windows
 runtime, CI, cross-build and simulated-interruption results separately.

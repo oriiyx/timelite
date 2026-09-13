@@ -97,6 +97,9 @@ struct timelite_batches
     uint64_t private_data_end;
     uint64_t private_installed;
     uint64_t private_generation;
+    uint64_t private_revision;
+    uint64_t private_live_batches;
+    int private_retention;
     uint64_t private_segment_end;
     uint64_t private_last_time;
     uint64_t private_installed_time;
@@ -115,13 +118,13 @@ struct timelite_batches
  * Existing WAL and database capacity constants remain the limits. */
 struct timelite_batches_status
 {
-    uint64_t committed_batches; /* Total committed batch count. */
+    uint64_t committed_batches; /* Currently retained committed batches, including WAL. */
     uint64_t installed_batches; /* Batches installed in the main file. */
     uint64_t pending_batches; /* Committed batches still in the WAL. */
     uint64_t installed_segments;
     uint64_t wal_bytes; /* Committed WAL extent, including its 32-byte header. */
     uint64_t installed_bytes; /* Segment headers and frames, excluding prefix. */
-    uint64_t last_timestamp_us; /* Zero when empty; check committed_batches. */
+    uint64_t last_timestamp_us; /* Historical append floor, even after all data expires. */
 };
 
 /* Uses handle metadata only: no I/O, scratch, allocation or scans.
@@ -156,6 +159,23 @@ int timelite_batches_open(struct timelite_batches *db, const char *database_path
 int timelite_batches_append(struct timelite_batches *db,
                             const struct timelite_record *records, size_t count,
                             void *scratch, size_t scratch_size, uint64_t *sequence);
+/* Expire installed whole segments with every timestamp < cutoff_us. Pending
+ * WAL is preserved. No matches succeeds without writes. Requires BATCH_SCRATCH.
+ * Retained batches preserve sequence/value/order; deleted sequences are never
+ * reused and the append timestamp floor survives complete expiration.
+ * Cursor resumes at its next surviving batch; END remains at its sequence.
+ * Temporary retained-copy space must fit the existing database cap; otherwise
+ * DATABASE_FULL has no effect. Argument/read rejection before writes preserves
+ * the handle; any failure after writes begin requires close/reopen. Recovery
+ * chooses coherent old/new retention and finishes internal relocation/reclaim.
+ * An effective call explicitly installs format 010; old libraries reject it.
+ * NULL arguments return EINVAL, short scratch BUFFER_TOO_SMALL, closed handles
+ * EBADF and poisoned handles RECOVERY_REQUIRED. Metadata revision exhaustion
+ * returns EOVERFLOW before writes. Scratch may change and must not overlap db.
+ * No allocation, automatic checkpoint, partial-segment deletion or policy. */
+int timelite_batches_expire_before(struct timelite_batches *db, uint64_t cutoff_us,
+                                   void *scratch, size_t scratch_size);
+
 /* Installs every committed WAL batch into the main file as one immutable
  * segment, durably switches the install manifest, then truncates the WAL.
  * Empty WAL: returns 0 without I/O. Manual only; append never checkpoints.
@@ -175,7 +195,8 @@ int timelite_batches_checkpoint(struct timelite_batches *db,
  * BUFFER_TOO_SMALL allows retry at same cursor. Scratch >= BATCH_SCRATCH required.
  * Returns installed batches, then WAL batches, in sequence order. A damaged
  * installed frame returns INVALID_DATABASE at that position without skipping.
- * At END, later serialized appends become visible. Rewind returns to batch 1. */
+ * At END, later serialized appends become visible. Rewind returns to the
+ * first retained batch. */
 int timelite_batches_next(struct timelite_batches *db,
                           struct timelite_record *records, size_t capacity,
                           size_t *count, uint64_t *sequence,

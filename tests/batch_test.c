@@ -53,13 +53,14 @@ static int capacity_fixture(struct timelite_file *file, unsigned char *scratch)
 {
     uint64_t data_end = TIMELITE_DATABASE_CAPACITY - 100, offset = 160, body;
     size_t transferred;
-    unsigned int i;
+    unsigned int i, n, target;
     int error;
     memset(scratch, 0, 64);
     memcpy(scratch, "TLINSTAL", 8);
     encode_fixture(scratch + 8, 16, 8);
     encode_fixture(scratch + 16, data_end, 8);
     encode_fixture(scratch + 24, UINT64_C(800000), 8);
+    encode_fixture(scratch + 32, 10, 8);
     encode_fixture(scratch + 40, 160 + 15 * TIMELITE_WAL_CAPACITY, 8);
     encode_fixture(scratch + 48, 7, 4);
     encode_fixture(scratch + 60, fixture_crc(scratch, 60), 4);
@@ -71,14 +72,20 @@ static int capacity_fixture(struct timelite_file *file, unsigned char *scratch)
     }
     for (i = 0; error == 0 && i < 16; i++)
     {
-        body = i < 15 ? TIMELITE_WAL_CAPACITY - 32 : data_end - offset - 32;
-        memcpy(scratch, "TLSEGMNT", 8);
+        body = i < 15 ? TIMELITE_WAL_CAPACITY - 64 : data_end - offset - 64;
+        memcpy(scratch, "TLSPAN07", 8);
         encode_fixture(scratch + 8, 1 + UINT64_C(50000) * i, 8);
         encode_fixture(scratch + 16, UINT64_C(50000) * (i + 1), 8);
         encode_fixture(scratch + 24, body, 4);
-        encode_fixture(scratch + 28, fixture_crc(scratch, 28), 4);
-        error = timelite_file_write(file, offset, scratch, 32, &transferred);
-        offset += 32 + body;
+        encode_fixture(scratch + 28, i == 15 ? 10 : 0, 8);
+        encode_fixture(scratch + 36, i == 15 ? 10 : 0, 8);
+        encode_fixture(scratch + 44, i == 0 ? 0 : offset - TIMELITE_WAL_CAPACITY, 8);
+        n = i + 1;
+        target = n - (n & (~n + 1));
+        encode_fixture(scratch + 52, target == 0 ? 0 : 160 + (target - 1) * TIMELITE_WAL_CAPACITY, 8);
+        encode_fixture(scratch + 60, fixture_crc(scratch, 60), 4);
+        error = timelite_file_write(file, offset, scratch, 64, &transferred);
+        offset += 64 + body;
     }
     if (error == 0)
     {
@@ -375,6 +382,66 @@ static void legacy_range(const char *path, const char *wal_path)
     assert(timelite_batches_next(&db, &record, 1, &count, &sequence,
                                 scratch, sizeof(scratch)) == 0 && sequence == 2);
     assert(timelite_batches_seek(&db, UINT64_MAX, scratch, sizeof(scratch)) == TIMELITE_END);
+    assert(timelite_batches_expire_before(&db, record.timestamp_us, scratch, sizeof(scratch)) == 0);
+    assert(timelite_batches_expire_before(&db, record.timestamp_us + 1, scratch, sizeof(scratch)) == 0);
+    status_values(&db, 0, 0, 0, 32, 0, record.timestamp_us);
+    assert(timelite_batches_close(&db) == 0);
+    assert(remove_test_file(path) == 0);
+    assert(remove_test_file(wal_path) == 0);
+}
+
+static void retention_native(const char *path, const char *wal_path)
+{
+    struct timelite_batches db;
+    struct timelite_record record = {7, 0, -10}, out;
+    struct timelite_range range = {0, 31, 7, 1};
+    struct timelite_aggregate aggregate;
+    struct timelite_file file = TIMELITE_FILE_INIT;
+    unsigned char scratch[TIMELITE_BATCH_SCRATCH];
+    uint64_t sequence, size;
+    size_t count;
+    int i;
+    TEST_CASE("native whole segment retention", 0);
+    assert(timelite_batches_init(&db) == 0);
+    assert(timelite_batches_open(&db, path, wal_path, TIMELITE_CREATE_NEW, scratch, sizeof(scratch)) == 0);
+    assert(timelite_batches_expire_before(&db, 1, scratch, sizeof(scratch)) == 0);
+    for (i = 0; i < 4; i++)
+    {
+        record.timestamp_us = (uint64_t)i * 10;
+        assert(timelite_batches_append(&db, &record, 1, scratch, sizeof(scratch), &sequence) == 0);
+        if (i == 0 || i == 2)
+        {
+            assert(timelite_batches_checkpoint(&db, scratch, sizeof(scratch)) == 0);
+        }
+    }
+    assert(timelite_batches_expire_before(&db, 15, scratch, sizeof(scratch)) == 0);
+    status_values(&db, 3, 2, 1, 116, 232, 30);
+    assert(timelite_batches_next(&db, &out, 1, &count, &sequence, scratch, sizeof(scratch)) == 0);
+    assert(sequence == 2 && out.timestamp_us == 10 && out.value == -10);
+    assert(timelite_batches_expire_before(&db, 20, scratch, sizeof(scratch)) == 0);
+    assert(timelite_batches_next(&db, &out, 1, &count, &sequence, scratch, sizeof(scratch)) == 0 && sequence == 3);
+    assert(timelite_batches_aggregate_range(&db, &range, &aggregate, scratch, sizeof(scratch)) == 0);
+    assert(aggregate.record_count == 3 && aggregate.minimum_value == -10 && aggregate.maximum_value == -10);
+    assert(timelite_batches_close(&db) == 0);
+    assert(timelite_file_open(&file, path) == 0);
+    assert(timelite_file_size(&file, &size) == 0 && size == 392);
+    assert(timelite_file_close(&file) == 0);
+    assert(timelite_batches_open(&db, path, wal_path, TIMELITE_OPEN_EXISTING, scratch, sizeof(scratch)) == 0);
+    assert(timelite_batches_seek(&db, 10, scratch, sizeof(scratch)) == 0);
+    assert(timelite_batches_next_range(&db, &range, &out, 1, &count, &sequence, scratch, sizeof(scratch)) == 0 && sequence == 2);
+    assert(timelite_batches_expire_before(&db, 31, scratch, sizeof(scratch)) == 0);
+    status_values(&db, 1, 0, 0, 116, 0, 30);
+    assert(timelite_batches_checkpoint(&db, scratch, sizeof(scratch)) == 0);
+    assert(timelite_batches_expire_before(&db, 31, scratch, sizeof(scratch)) == 0);
+    status_values(&db, 0, 0, 0, 32, 0, 30);
+    assert(timelite_batches_close(&db) == 0);
+    assert(timelite_batches_open(&db, path, wal_path, TIMELITE_OPEN_EXISTING, scratch, sizeof(scratch)) == 0);
+    record.timestamp_us = 29;
+    assert(timelite_batches_append(&db, &record, 1, scratch, sizeof(scratch), &sequence) == TIMELITE_OUT_OF_ORDER);
+    record.timestamp_us = 30;
+    assert(timelite_batches_append(&db, &record, 1, scratch, sizeof(scratch), &sequence) == 0 && sequence == 5);
+    assert(timelite_batches_checkpoint(&db, scratch, sizeof(scratch)) == 0);
+    assert(timelite_batches_next(&db, &out, 1, &count, &sequence, scratch, sizeof(scratch)) == 0 && sequence == 5);
     assert(timelite_batches_close(&db) == 0);
     assert(remove_test_file(path) == 0);
     assert(remove_test_file(wal_path) == 0);
@@ -644,6 +711,22 @@ int main(void)
         assert(timelite_file_open(&file, wal_path) == 0);
         assert(timelite_file_size(&file, &size) == 0 && size == 32 + 2 * 84);
         assert(timelite_file_close(&file) == 0);
+        assert(timelite_batches_open(&db, path, wal_path, TIMELITE_OPEN_EXISTING,
+                                    scratch, sizeof(scratch)) == 0);
+        TEST_CASE("retention near capacity and reuse", 0);
+        {
+            struct timelite_batches before = db;
+            assert(timelite_batches_expire_before(&db, 1, scratch, sizeof(scratch)) == TIMELITE_DATABASE_FULL);
+            assert(memcmp(&db, &before, sizeof(db)) == 0);
+        }
+        assert(timelite_batches_expire_before(&db, 11, scratch, sizeof(scratch)) == 0);
+        assert(timelite_batches_checkpoint(&db, scratch, sizeof(scratch)) == 0);
+        assert(timelite_batches_append(&db, input, 1, scratch, sizeof(scratch), &sequence) == 0 && sequence == 800003);
+        assert(timelite_batches_checkpoint(&db, scratch, sizeof(scratch)) == 0);
+        assert(timelite_batches_close(&db) == 0);
+        assert(timelite_file_open(&file, path) == 0);
+        assert(timelite_file_size(&file, &size) == 0 && size == 540);
+        assert(timelite_file_close(&file) == 0);
     }
     else
     {
@@ -652,6 +735,7 @@ int main(void)
     }
     assert(remove_test_file(path) == 0);
     assert(remove_test_file(wal_path) == 0);
+    retention_native(path, wal_path);
     aggregate_ranges(path, wal_path);
     time_ranges(path, wal_path);
     legacy_range(path, wal_path);

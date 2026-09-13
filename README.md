@@ -2,8 +2,8 @@
 
 A small embedded time-series database project in C99. The current version is a
 library with durable sensor batch append, recovery, sequential reading and
-explicit checkpointing: committed WAL batches are installed into the main
-database file as immutable segments and the WAL is reclaimed only after that
+explicit checkpointing and whole-segment retention: committed WAL batches are
+installed into the main database file as immutable segments and the WAL is reclaimed only after that
 install is durable, on supported local POSIX filesystems. The original v1
 lifecycle API remains available. Windows retains lifecycle and file I/O; durable
 batch provisioning currently returns `ENOTSUP`. Feature 005 is the repeatable
@@ -306,8 +306,8 @@ open handle or externally modify, rename, replace or delete its files/directorie
 The WAL limit is 64 MiB including its 32-byte header. A batch occupies
 64 + 20 × record count bytes (84..1344). `TIMELITE_WAL_FULL` rejects a batch
 before writes; committed WAL data is never overwritten and is reclaimed only by
-checkpoint. There is no rotation, retention, compaction or
-per-series index.
+checkpoint. There is no rotation, general compaction or per-series index. Explicit
+whole-segment retention is described below.
 
 ### Time-range aggregation
 
@@ -353,8 +353,12 @@ if (error == 0)
 ```
 
 Status includes total committed and installed batches, installed segments,
-installed bytes and the last committed timestamp. Use `committed_batches` to
-distinguish an empty database from timestamp zero. Byte counts describe logical
+installed bytes and the last committed timestamp. Counts describe currently
+retained batches, so `committed_batches` equals
+`installed_batches + pending_batches`; deleted sequences do not count.
+`last_timestamp_us` preserves the historical append floor even when all counts
+are zero; it is not necessarily the timestamp of a currently retained reading.
+Byte counts describe logical
 committed data, not physical allocation or orphan bytes: WAL bytes include its
 32-byte header; installed bytes include segment headers and frames but exclude
 the database prefix. `TIMELITE_WAL_CAPACITY` and `TIMELITE_DATABASE_CAPACITY`
@@ -362,6 +366,55 @@ remain the limits. The getter uses only handle metadata, needs no scratch or
 I/O, and preserves ownership, cursor and database state. NULL arguments return
 `EINVAL`, closed handles `EBADF`, and poisoned handles
 `TIMELITE_RECOVERY_REQUIRED`; errors leave status unchanged.
+
+### Explicit retention
+
+```c
+/* The application chooses cutoff_us and exports data first if needed. */
+int error = timelite_batches_expire_before(&db, cutoff_us,
+                                           scratch, sizeof(scratch));
+```
+
+Only installed segments whose every timestamp is strictly less than `cutoff_us`
+expire. A segment containing any timestamp equal to or above the cutoff stays
+whole, including its older records. Pending WAL batches stay intact; retention
+never checkpoints. Empty databases and no eligible segments succeed without
+writes. Use the usual `TIMELITE_BATCH_SCRATCH` caller-owned buffer.
+
+Surviving records keep their order, values and original batch sequences, which
+may now have gaps. Append sequences never restart, and the global timestamp
+floor survives even complete expiration. The cursor keeps its next surviving
+batch: when that batch expires it advances to the first surviving successor,
+or END. An existing END stays there and observes later serialized appends.
+Rewind starts at the first retained batch. Status counts exclude expired batches;
+its timestamp remains the historical append floor.
+
+The operation copies retained segments to unused tail space, durably switches
+its two-slot manifest, copies them back to the front, switches again, then
+truncates and syncs. This physically reclaims space for subsequent checkpoints.
+Both copies must fit inside the unchanged 1 GiB main-file limit: if the original
+logical end plus retained segment bytes exceeds it, `TIMELITE_DATABASE_FULL`
+returns before writes. Call early enough to leave that temporary room, or choose
+a cutoff that expires more segments. Complete expiration needs no temporary
+payload space. The WAL limit remains 64 MiB. Copying may require substantial
+I/O; there is no background work or automatic policy.
+
+NULL/scratch/closed/poisoned errors follow existing conventions. Pre-write errors
+preserve the handle. Any error after writes begin poisons it until close/reopen;
+the operation may already have taken effect. Recovery preserves a coherent old
+or new set, finishes interrupted internal relocation/truncation, and never loses
+retained records or the sequence high-water mark. Recovery itself can fail and
+be retried by reopening. Existing filesystem, serialized ownership and flush
+qualifications apply; model interruption tests are not physical power-cut proof.
+
+An effective retention call explicitly installs the Feature 010 manifest format;
+opening an old database or making a no-op call does not migrate it. Feature
+004/006/007 segments remain readable; legacy segments without timestamp spans
+require record scans. Older libraries reject the completed retention layout.
+An empty retained main file occupies 161 bytes so it cannot be mistaken for an
+old empty database; that extra byte is excluded from logical installed bytes.
+There is no automatic format migration. See [Feature 010](docs/feature/010-retention.md)
+for the encoding, persistence boundaries and verification.
 
 ### Checkpoint
 
@@ -399,7 +452,8 @@ payloads for new layouts, so checkpoint
 many batches at a time rather than one. `TIMELITE_DATABASE_CAPACITY` (1 GiB)
 bounds the main file; when the next segment would not fit, checkpoint returns
 `TIMELITE_DATABASE_FULL` before any effect and appends continue until the WAL
-is full, after which the pair is read-only until a future retention feature.
+is full, after which successful explicit retention is needed to reclaim
+installed space.
 A database created by feature 004 (exactly 32 bytes) opens unchanged and gains
 its manifest slots on its first checkpoint; the feature 004 library fails closed
 without writing on a checkpointed pair. Feature 007 adds the last installed
@@ -452,7 +506,7 @@ layouts, compatibility behavior and verification results.
 `timelite_batches_next` returns only whole validated batches, installed
 segments first and then the WAL, in sequence order. `TIMELITE_END`
 means the cursor reached currently committed data; later serialized appends are
-visible at that cursor. `timelite_batches_rewind` restarts at sequence 1.
+visible at that cursor. `timelite_batches_rewind` restarts at the first retained batch.
 `TIMELITE_BUFFER_TOO_SMALL` leaves cursor and output unchanged, allowing retry
 with larger buffers. Errors and END leave count, sequence and record outputs
 unchanged; scratch contents are unspecified. A successful append returns the
@@ -460,8 +514,8 @@ next sequence, starting at 1. Reopen derives that sequence from validated commit
 
 Positive returns are errno values; negative returns are Timelite results declared
 in [timelite.h](timelite.h). Argument/buffer/capacity rejection leaves the handle
-usable. Any append or checkpoint write or sync error poisons reads, appends and
-checkpoints with `TIMELITE_RECOVERY_REQUIRED` until close/reopen. The failed batch may still be
+usable. Any append, checkpoint or retention write or sync error poisons reads, appends and
+mutating operations with `TIMELITE_RECOVERY_REQUIRED` until close/reopen. The failed batch may still be
 committed: enumerate sequences and contents after reopen before deciding to retry.
 Identical contents cannot distinguish independent identical readings from a retry;
 there is no exactly-once promise. Close consumes both resources even on failure;

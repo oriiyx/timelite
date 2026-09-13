@@ -1418,6 +1418,37 @@ static void legacy_unordered(void)
         assert(sequence == (uint64_t)i && output[0].timestamp_us == (uint64_t)i * 10);
     }
     assert(timelite_batches_next_range(&db, &range, output, 64, &count, &sequence, scratch, sizeof(scratch)) == TIMELITE_END);
+    /* Mix a real 006 header with later span-bearing segments. */
+    assert(timelite_batches_close(&db) == 0);
+    memmove(database_bytes + 192, database_bytes + 224, files[0].length - 224);
+    files[0].length -= 32;
+    memcpy(database_bytes + 160, "TLSEGMNT", 8);
+    fixture_crc(database_bytes + 160, 28);
+    encode_fixture32(database_bytes + 32 + 16, (uint32_t)files[0].length);
+    encode_fixture32(database_bytes + 32 + 40, 360);
+    fixture_crc(database_bytes + 32, 60);
+    files[0].dirty = 0;
+    assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
+    record.timestamp_us = 110;
+    assert(timelite_batches_append(&db, &record, 1, scratch, sizeof(scratch), &sequence) == 0);
+    assert(checkpoint(&db) == 0);
+    assert(timelite_batches_expire_before(&db, 50, scratch, sizeof(scratch)) == 0);
+    assert(timelite_batches_rewind(&db) == 0);
+    for (i = 1; i <= 4; i++)
+    {
+        if (i == 3)
+        {
+            continue;
+        }
+        assert(timelite_batches_next(&db, output, 64, &count, &sequence, scratch, sizeof(scratch)) == 0);
+        assert(sequence == (uint64_t)i);
+    }
+    assert(timelite_batches_close(&db) == 0);
+    assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
+    assert(db.private_installed == 4 && db.private_live_batches == 3);
+    assert(timelite_batches_expire_before(&db, 101, scratch, sizeof(scratch)) == 0);
+    assert(timelite_batches_rewind(&db) == 0);
+    assert(timelite_batches_next(&db, output, 64, &count, &sequence, scratch, sizeof(scratch)) == 0 && sequence == 4);
     assert(timelite_batches_close(&db) == 0);
     /* Zero is a persisted timestamp, distinguished by marker 7. */
     new_db(&db);
@@ -1428,6 +1459,7 @@ static void legacy_unordered(void)
     assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
     assert(db.private_last_time == 0 && database_bytes[144] == 7);
     assert(timelite_batches_close(&db) == 0);
+
 }
 
 static void aggregate_errors(void)
@@ -1516,6 +1548,391 @@ static void aggregate_errors(void)
     aggregate_checking = 0;
 }
 
+static int expire(struct timelite_batches *db, uint64_t cutoff)
+{
+    return timelite_batches_expire_before(db, cutoff, scratch, sizeof(scratch));
+}
+
+static void retention_fixture(struct timelite_batches *db)
+{
+    uint64_t i;
+    new_db(db);
+    for (i = 1; i <= 6; i++)
+    {
+        input[0].timestamp_us = i <= 2 ? 0 : (i - 2) * 10;
+        append_one(db, i);
+        if (i != 3 && i != 6)
+        {
+            assert(checkpoint(db) == 0);
+        }
+    }
+    faults_clear();
+}
+
+static void retention_contents(struct timelite_batches *db, int expired)
+{
+    uint64_t sequence, i;
+    size_t count;
+    struct timelite_batches_status status;
+    struct timelite_range range = {0, 41, 0, 0};
+    struct timelite_aggregate result;
+    assert(timelite_batches_rewind(db) == 0);
+    for (i = expired ? 3 : 1; i <= 6; i++)
+    {
+        assert(timelite_batches_next(db, output, 64, &count, &sequence,
+                                     scratch, sizeof(scratch)) == 0);
+        assert(sequence == i && count == 1 && output[0].value == -123);
+        assert(output[0].timestamp_us == (i <= 2 ? 0 : (i - 2) * 10));
+    }
+    assert(timelite_batches_next(db, output, 64, &count, &sequence,
+                                 scratch, sizeof(scratch)) == TIMELITE_END);
+    assert(timelite_batches_get_status(db, &status) == 0);
+    assert(status.installed_batches == (expired ? 4 : 6) - status.pending_batches);
+    assert(status.committed_batches == (expired ? 4 : 6));
+    assert(status.pending_batches <= 1 && status.last_timestamp_us == 40);
+    assert(status.installed_segments == (expired ? 3 : 5) - status.pending_batches);
+    assert(timelite_batches_aggregate_range(db, &range, &result, scratch, sizeof(scratch)) == 0);
+    assert(result.record_count == (expired ? 4 : 6));
+    assert(result.minimum_value == -123 && result.maximum_value == -123);
+    assert(timelite_batches_seek(db, 10, scratch, sizeof(scratch)) == 0);
+    assert(timelite_batches_next_range(db, &range, output, 64, &count, &sequence,
+                                       scratch, sizeof(scratch)) == 0 && sequence == 3);
+}
+
+static void retention_behavior(void)
+{
+    struct timelite_batches db, before;
+    struct timelite_batches_status status;
+    uint64_t sequence, i;
+    size_t count;
+    int position, prior_writes;
+    new_db(&db);
+    before = db;
+    prior_writes = writes;
+    assert(expire(&db, 0) == 0 && expire(&db, UINT64_MAX) == 0);
+    assert(memcmp(&db, &before, sizeof(db)) == 0 && writes == prior_writes);
+    assert(timelite_batches_close(&db) == 0);
+    for (position = 0; position <= 6; position++)
+    {
+        TEST_CASE("retention cursor and retained queries", position);
+        retention_fixture(&db);
+        for (i = 0; i < (uint64_t)position; i++)
+        {
+            assert(timelite_batches_next(&db, output, 64, &count, &sequence,
+                                         scratch, sizeof(scratch)) == 0);
+        }
+        before = db;
+        prior_writes = writes;
+        assert(expire(&db, 0) == 0);
+        assert(memcmp(&db, &before, sizeof(db)) == 0 && prior_writes == writes);
+        assert(expire(&db, 15) == 0);
+        assert(files[0].length == 160 + 2 * 64 + 3 * 84);
+        assert(files[1].length == 116);
+        assert(timelite_batches_next(&db, output, 64, &count, &sequence,
+                                     scratch, sizeof(scratch)) == (position == 6 ? TIMELITE_END : 0));
+        if (position != 6)
+        {
+            assert(sequence == (position < 2 ? 3 : (uint64_t)position + 1));
+        }
+        retention_contents(&db, 1);
+        before = db;
+        assert(expire(&db, 20) == 0); /* spanning segment includes equal cutoff */
+        assert(memcmp(&db, &before, sizeof(db)) == 0);
+        assert(timelite_batches_close(&db) == 0);
+        assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
+        retention_contents(&db, 1);
+        assert(expire(&db, UINT64_MAX) == 0);
+        assert(files[0].length == 161 && files[1].length == 116);
+        assert(timelite_batches_get_status(&db, &status) == 0);
+        assert(status.committed_batches == 1 && status.installed_batches == 0);
+        assert(checkpoint(&db) == 0); /* reclaimed front is reusable */
+        assert(expire(&db, UINT64_MAX) == 0);
+        assert(timelite_batches_get_status(&db, &status) == 0);
+        assert(status.committed_batches == 0 && status.installed_bytes == 0);
+        assert(status.last_timestamp_us == 40);
+        assert(timelite_batches_close(&db) == 0);
+        assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
+        input[0].timestamp_us = 39;
+        assert(timelite_batches_append(&db, input, 1, scratch, sizeof(scratch), &sequence) == TIMELITE_OUT_OF_ORDER);
+        input[0].timestamp_us = 40;
+        append_one(&db, 7);
+        assert(checkpoint(&db) == 0);
+        assert(timelite_batches_rewind(&db) == 0);
+        assert(timelite_batches_next(&db, output, 64, &count, &sequence,
+                                     scratch, sizeof(scratch)) == 0 && sequence == 7);
+        assert(timelite_batches_close(&db) == 0);
+    }
+    retention_fixture(&db);
+    before = db;
+    assert(timelite_batches_expire_before(NULL, 15, scratch, sizeof(scratch)) == EINVAL);
+    assert(timelite_batches_expire_before(&db, 15, NULL, sizeof(scratch)) == EINVAL);
+    assert(timelite_batches_expire_before(&db, 15, scratch, sizeof(scratch) - 1) == TIMELITE_BUFFER_TOO_SMALL);
+    assert(memcmp(&db, &before, sizeof(db)) == 0);
+    db.private_failed = 1;
+    assert(expire(&db, 15) == TIMELITE_RECOVERY_REQUIRED);
+    assert(timelite_batches_close(&db) == 0);
+    assert(expire(&db, 15) == EBADF);
+    input[0].timestamp_us = UINT64_C(1700000000000000);
+}
+
+static void retention_boundaries(void)
+{
+    struct timelite_batches db, before;
+    int total, reads, boundary, after, survive, error, was_failed, complete;
+    for (complete = 0; complete <= 3; complete++)
+    {
+        retention_fixture(&db);
+        if (complete >= 2)
+        {
+            assert(checkpoint(&db) == 0);
+            faults_clear();
+        }
+        assert(expire(&db, (complete & 1) ? 100 : 15) == 0);
+        total = operation;
+        reads = read_calls;
+        assert(timelite_batches_close(&db) == 0);
+        for (boundary = 1; boundary <= total + 2; boundary++)
+        {
+            for (after = 0; after <= 1; after++)
+            {
+                for (survive = 0; survive <= 1; survive++)
+                {
+                    TEST_CASE((complete & 1) ? "complete retention interruption" : "retention interruption",
+                               boundary * 100 + after * 10 + survive);
+                    retention_fixture(&db);
+                    if (complete >= 2)
+                    {
+                        assert(checkpoint(&db) == 0);
+                        faults_clear();
+                    }
+                    if (boundary <= total)
+                    {
+                        fail_operation = boundary;
+                        fail_after = after;
+                    }
+                    else
+                    {
+                        truncate_failure = boundary - total;
+                    }
+                    assert(expire(&db, (complete & 1) ? 100 : 15) == EIO);
+                    assert(files[0].owned && files[1].owned);
+                    assert(expire(&db, 15) == TIMELITE_RECOVERY_REQUIRED);
+                    if (survive)
+                    {
+                        persist(0);
+                        persist(1);
+                    }
+                    crash();
+                    assert(timelite_batches_init(&db) == 0);
+                    assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
+                    if (!(complete & 1) || db.private_generation != 0)
+                    {
+                        retention_contents(&db, (db.private_generation == 2 || db.private_generation == 3));
+                    }
+                    else
+                    {
+                        assert(db.private_sequence == 6 && db.private_installed == (complete >= 2 ? 6 : 5));
+                        assert(db.private_last_time == 40 && db.private_end == (complete >= 2 ? 32 : 116));
+                    }
+                    assert(expire(&db, (complete & 1) ? 100 : 15) == 0);
+                    if (!(complete & 1))
+                    {
+                        retention_contents(&db, 1);
+                    }
+                    assert(timelite_batches_close(&db) == 0);
+                    assert(!files[0].owned && !files[1].owned);
+                }
+            }
+        }
+        for (boundary = 1; boundary <= reads; boundary++)
+        {
+            TEST_CASE("retention read failure", boundary);
+            retention_fixture(&db);
+            if (complete >= 2)
+            {
+                assert(checkpoint(&db) == 0);
+                faults_clear();
+            }
+            before = db;
+            fail_read_at = boundary;
+            error = expire(&db, (complete & 1) ? 100 : 15);
+            assert(error == EIO);
+            was_failed = db.private_failed;
+            if (!was_failed)
+            {
+                assert(memcmp(&db, &before, sizeof(db)) == 0);
+            }
+            crash();
+            assert(timelite_batches_init(&db) == 0);
+            assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
+            assert(db.private_sequence == 6 && db.private_last_time == 40);
+            assert(timelite_batches_close(&db) == 0);
+        }
+    }
+    input[0].timestamp_us = UINT64_C(1700000000000000);
+}
+
+static void retention_recovery_boundaries(void)
+{
+    struct timelite_batches db;
+    int phase, boundary, after, survive, total, error;
+    const int stop[] = {3, 11, 19};
+    const int operations[] = {3, 11, 3};
+    for (phase = 0; phase < 3; phase++)
+    {
+        total = operations[phase];
+        for (boundary = 1; boundary <= total + 2; boundary++)
+        {
+            for (after = 0; after <= 1; after++)
+            {
+                for (survive = 0; survive <= 1; survive++)
+                {
+                    TEST_CASE("retention recovery interruption", phase * 10000 + boundary * 100 + after * 10 + survive);
+                    retention_fixture(&db);
+                    fail_operation = stop[phase];
+                    assert(expire(&db, 15) == EIO);
+                    crash();
+                    assert(timelite_batches_init(&db) == 0);
+                    if (boundary <= total)
+                    {
+                        fail_operation = boundary;
+                        fail_after = after;
+                    }
+                    else
+                    {
+                        truncate_failure = boundary - total;
+                    }
+                    error = open_db(&db, TIMELITE_OPEN_EXISTING);
+                    assert(error == EIO && !files[0].owned && !files[1].owned);
+                    if (survive)
+                    {
+                        persist(0);
+                    }
+                    crash();
+                    assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
+                    retention_contents(&db, phase != 0);
+                    assert(timelite_batches_close(&db) == 0);
+                }
+            }
+        }
+    }
+    input[0].timestamp_us = UINT64_C(1700000000000000);
+}
+
+static void retention_torn_writes(void)
+{
+    struct timelite_batches db;
+    const int boundaries[] = {1, 3, 4, 9, 11, 12, 17, 20};
+    size_t i, prefix, length;
+    for (i = 0; i < sizeof(boundaries) / sizeof(boundaries[0]); i++)
+    {
+        length = boundaries[i] == 4 || boundaries[i] == 12 ? 84 : 64;
+        for (prefix = 0; prefix < length; prefix++)
+        {
+            TEST_CASE("retention torn metadata/header/frame", boundaries[i] * 100 + (int)prefix);
+            retention_fixture(&db);
+            short_operation = boundaries[i];
+            transfer_limit = prefix;
+            assert(expire(&db, 15) == EIO);
+            persist(0); /* A partial write can survive even without a sync. */
+            crash();
+            assert(timelite_batches_init(&db) == 0);
+            assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
+            retention_contents(&db, boundaries[i] >= 11);
+            assert(timelite_batches_close(&db) == 0);
+        }
+    }
+    input[0].timestamp_us = UINT64_C(1700000000000000);
+}
+
+static void retention_legacy_floor(void)
+{
+    struct timelite_batches db;
+    struct timelite_record record = {7, 100, 1};
+    struct timelite_range range = {0, 50, 0, 0};
+    struct timelite_aggregate result;
+    uint64_t sequence;
+    int phase;
+    TEST_CASE("retention exposes older ordered data above legacy floor", 0);
+    new_db(&db);
+    assert(timelite_batches_append(&db, &record, 1, scratch, sizeof(scratch), &sequence) == 0);
+    assert(checkpoint(&db) == 0);
+    assert(timelite_batches_append(&db, &record, 1, scratch, sizeof(scratch), &sequence) == 0);
+    assert(timelite_batches_close(&db) == 0);
+    wal_bytes[68] = 20;
+    encode_fixture32(wal_bytes + 108, fixture_crc_value(wal_bytes + 32, 52));
+    fixture_crc(wal_bytes + 84, 28);
+    assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
+    assert(checkpoint(&db) == 0);
+    record.timestamp_us = 30;
+    assert(timelite_batches_append(&db, &record, 1, scratch, sizeof(scratch), &sequence) == 0);
+    assert(expire(&db, 50) == 0);
+    for (phase = 0; phase < 3; phase++)
+    {
+        assert(timelite_batches_aggregate_range(&db, &range, &result, scratch, sizeof(scratch)) == 0);
+        assert(result.record_count == 1 && result.minimum_value == 1);
+        if (phase == 0)
+        {
+            assert(timelite_batches_close(&db) == 0);
+            assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
+        }
+        else if (phase == 1)
+        {
+            assert(checkpoint(&db) == 0);
+        }
+    }
+    assert(timelite_batches_close(&db) == 0);
+}
+
+static void retention_end_and_checkpoint(void)
+{
+    struct timelite_batches db;
+    uint64_t sequence;
+    size_t count;
+    int boundary, after;
+    TEST_CASE("retention END sees future append", 0);
+    new_db(&db);
+    input[0].timestamp_us = 0;
+    append_one(&db, 1);
+    assert(checkpoint(&db) == 0);
+    assert(timelite_batches_seek(&db, 1, scratch, sizeof(scratch)) == TIMELITE_END);
+    assert(expire(&db, 1) == 0);
+    append_one(&db, 2);
+    assert(timelite_batches_next(&db, output, 64, &count, &sequence, scratch, sizeof(scratch)) == 0 && sequence == 2);
+    input[0].timestamp_us = UINT64_MAX;
+    append_one(&db, 3);
+    assert(checkpoint(&db) == 0);
+    assert(expire(&db, UINT64_MAX) == 0);
+    assert(db.private_live_batches == 2); /* mixed zero/MAX segment stays whole */
+    assert(timelite_batches_close(&db) == 0);
+    for (boundary = 1; boundary <= 8; boundary++)
+    {
+        for (after = 0; after <= 1; after++)
+        {
+            TEST_CASE("checkpoint after retention revision", boundary * 10 + after);
+            retention_fixture(&db);
+            assert(expire(&db, 15) == 0);
+            faults_clear();
+            if (boundary <= 6)
+            {
+                fail_operation = boundary;
+                fail_after = after;
+            }
+            else
+            {
+                truncate_failure = boundary - 6;
+            }
+            assert(checkpoint(&db) == EIO);
+            crash();
+            assert(timelite_batches_init(&db) == 0);
+            assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
+            retention_contents(&db, 1);
+            assert(timelite_batches_close(&db) == 0);
+        }
+    }
+    input[0].timestamp_us = UINT64_C(1700000000000000);
+}
+
 int main(void)
 {
     input[0].series = 17;
@@ -1540,6 +1957,12 @@ int main(void)
     aggregate_errors();
     indexed_reads();
     legacy_unordered();
+    retention_behavior();
+    retention_boundaries();
+    retention_recovery_boundaries();
+    retention_torn_writes();
+    retention_legacy_floor();
+    retention_end_and_checkpoint();
     capacity();
     puts("batch persisted/volatile model, checkpoint boundaries, recovery and 64 MiB capacity: passed");
     return 0;
