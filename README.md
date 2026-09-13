@@ -295,7 +295,7 @@ exact without per-series state in the handle. Old records remain readable in
 their original order; they are not retroactively sorted.
 Empty batches and more than 64 readings return `EINVAL` before writes.
 
-Caller owns the handle, records and scratch. Every batch operation takes at least
+Caller owns the handle, records and scratch. Batch operations with scratch arguments take at least
 `TIMELITE_BATCH_SCRATCH` (1344) scratch bytes. Output capacity is in records;
 64 records always suffice. Public struct size can include platform padding;
 encoded records are exactly 20 bytes. No allocation, retained buffers, global
@@ -308,6 +308,32 @@ The WAL limit is 64 MiB including its 32-byte header. A batch occupies
 before writes; committed WAL data is never overwritten and is reclaimed only by
 checkpoint. There is no rotation, retention, compaction, aggregation or
 per-series index.
+
+### Database status
+
+Read caller-owned status to monitor capacity and decide when to call manual
+checkpoint:
+
+```c
+struct timelite_batches_status status;
+int error = timelite_batches_get_status(&db, &status);
+if (error == 0)
+{
+    printf("pending batches=%" PRIu64 ", WAL bytes=%" PRIu64 "\n",
+           status.pending_batches, status.wal_bytes);
+}
+```
+
+Status includes total committed and installed batches, installed segments,
+installed bytes and the last committed timestamp. Use `committed_batches` to
+distinguish an empty database from timestamp zero. Byte counts describe logical
+committed data, not physical allocation or orphan bytes: WAL bytes include its
+32-byte header; installed bytes include segment headers and frames but exclude
+the database prefix. `TIMELITE_WAL_CAPACITY` and `TIMELITE_DATABASE_CAPACITY`
+remain the limits. The getter uses only handle metadata, needs no scratch or
+I/O, and preserves ownership, cursor and database state. NULL arguments return
+`EINVAL`, closed handles `EBADF`, and poisoned handles
+`TIMELITE_RECOVERY_REQUIRED`; errors leave status unchanged.
 
 ### Checkpoint
 

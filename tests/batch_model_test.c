@@ -19,6 +19,7 @@ struct model_file
     int exists, stable_exists, owned;
 };
 static struct model_file files[2];
+static int status_checking;
 static int operation, fail_operation, fail_after, error_code;
 static size_t transfer_limit;
 static int read_failure, size_failure, close_failure, truncate_failure;
@@ -99,6 +100,7 @@ static void crash(void)
 
 int timelite_file_open(struct timelite_file *file, const char *path)
 {
+    assert(!status_checking);
     int index = strcmp(path, "db") == 0 ? 0 : 1;
     if (!files[index].exists)
     {
@@ -110,6 +112,7 @@ int timelite_file_open(struct timelite_file *file, const char *path)
 
 int timelite_file_create(struct timelite_file *file, const char *path)
 {
+    assert(!status_checking);
     int index = strcmp(path, "db") == 0 ? 0 : 1;
     if (create_failure == index + 1)
     {
@@ -138,6 +141,7 @@ int timelite_file_create(struct timelite_file *file, const char *path)
 
 int timelite_file_identity(unsigned char identity[16])
 {
+    assert(!status_checking);
     memset(identity, 0x42, 16);
     return identity_failure;
 }
@@ -145,6 +149,7 @@ int timelite_file_identity(unsigned char identity[16])
 int timelite_file_read(struct timelite_file *file, uint64_t offset,
                        void *buffer, size_t length, size_t *count)
 {
+    assert(!status_checking);
     struct model_file *f = &files[index_of(file)];
     read_calls++;
     if (length > 32)
@@ -174,6 +179,7 @@ int timelite_file_read(struct timelite_file *file, uint64_t offset,
 int timelite_file_write(struct timelite_file *file, uint64_t offset,
                         const void *buffer, size_t length, size_t *count)
 {
+    assert(!status_checking);
     int index = index_of(file);
     struct model_file *f = &files[index];
     operation++;
@@ -205,6 +211,7 @@ int timelite_file_write(struct timelite_file *file, uint64_t offset,
 
 int timelite_file_sync(struct timelite_file *file)
 {
+    assert(!status_checking);
     operation++;
     if (operation == fail_operation && !fail_after)
     {
@@ -216,6 +223,7 @@ int timelite_file_sync(struct timelite_file *file)
 
 int timelite_file_provision(struct timelite_file *file, const char *path)
 {
+    assert(!status_checking);
     int index = index_of(file);
     (void)path;
     provisions++;
@@ -230,6 +238,7 @@ int timelite_file_provision(struct timelite_file *file, const char *path)
 
 int timelite_file_size(struct timelite_file *file, uint64_t *size)
 {
+    assert(!status_checking);
     if (size_failure)
     {
         return EIO;
@@ -240,6 +249,7 @@ int timelite_file_size(struct timelite_file *file, uint64_t *size)
 
 int timelite_file_truncate(struct timelite_file *file, uint64_t size)
 {
+    assert(!status_checking);
     struct model_file *f = &files[index_of(file)];
     truncates++;
     if (truncate_failure == 1)
@@ -257,6 +267,7 @@ int timelite_file_truncate(struct timelite_file *file, uint64_t size)
 
 int timelite_file_close(struct timelite_file *file)
 {
+    assert(!status_checking);
     files[index_of(file)].owned = 0;
 #if defined(_WIN32)
     file->handle = NULL;
@@ -694,6 +705,81 @@ static void append_one(struct timelite_batches *db, uint64_t expected)
     uint64_t sequence = 99;
     assert(timelite_batches_append(db, input, 1, scratch, sizeof(scratch), &sequence) == 0);
     assert(sequence == expected);
+}
+
+static void status_values(struct timelite_batches *db, uint64_t committed,
+                          uint64_t installed, uint64_t segments,
+                          uint64_t wal, uint64_t bytes, uint64_t timestamp)
+{
+    struct timelite_batches_status status;
+    unsigned char before[sizeof(*db)];
+    memcpy(before, db, sizeof(*db));
+    status_checking = 1;
+    assert(timelite_batches_get_status(db, &status) == 0);
+    status_checking = 0;
+    assert(status.committed_batches == committed);
+    assert(status.installed_batches == installed);
+    assert(status.pending_batches == committed - installed);
+    assert(status.installed_segments == segments);
+    assert(status.wal_bytes == wal && status.installed_bytes == bytes);
+    assert(status.last_timestamp_us == timestamp);
+    assert(memcmp(before, db, sizeof(*db)) == 0);
+}
+
+static void status_errors(struct timelite_batches *db, int expected)
+{
+    struct timelite_batches_status status;
+    unsigned char before[sizeof(status)], handle[sizeof(*db)];
+    memset(&status, 0xa5, sizeof(status));
+    memcpy(before, &status, sizeof(status));
+    memcpy(handle, db, sizeof(*db));
+    status_checking = 1;
+    assert(timelite_batches_get_status(NULL, &status) == EINVAL);
+    assert(timelite_batches_get_status(NULL, NULL) == EINVAL);
+    assert(timelite_batches_get_status(db, NULL) == EINVAL);
+    assert(timelite_batches_get_status(db, &status) == expected);
+    status_checking = 0;
+    assert(memcmp(before, &status, sizeof(status)) == 0);
+    assert(memcmp(handle, db, sizeof(*db)) == 0);
+}
+
+static void database_status(void)
+{
+    struct timelite_batches db;
+    uint64_t saved_timestamp = input[0].timestamp_us;
+    uint64_t sequence;
+    size_t count;
+    TEST_CASE("metadata status lifecycle and no storage operations", 0);
+    new_db(&db);
+    status_values(&db, 0, 0, 0, 32, 0, 0);
+    input[0].timestamp_us = 0;
+    append_one(&db, 1);
+    status_values(&db, 1, 0, 0, 116, 0, 0);
+    assert(timelite_batches_next(&db, output, 64, &count, &sequence,
+                                scratch, sizeof(scratch)) == 0);
+    status_values(&db, 1, 0, 0, 116, 0, 0);
+    assert(checkpoint(&db) == 0);
+    status_values(&db, 1, 1, 1, 32, 148, 0);
+    input[0].timestamp_us = 42;
+    append_one(&db, 2);
+    status_values(&db, 2, 1, 1, 116, 148, 42);
+    assert(timelite_batches_next(&db, output, 64, &count, &sequence,
+                                scratch, sizeof(scratch)) == 0);
+    assert(sequence == 2);
+    assert(timelite_batches_close(&db) == 0);
+    status_errors(&db, EBADF);
+    assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
+    status_values(&db, 2, 1, 1, 116, 148, 42);
+    assert(checkpoint(&db) == 0);
+    status_values(&db, 2, 2, 2, 32, 296, 42);
+    operation = 0;
+    fail_operation = 1;
+    assert(timelite_batches_append(&db, input, 1, scratch, sizeof(scratch),
+                                  &sequence) == EIO);
+    status_errors(&db, TIMELITE_RECOVERY_REQUIRED);
+    faults_clear();
+    assert(timelite_batches_close(&db) == 0);
+    input[0].timestamp_us = saved_timestamp;
 }
 
 static void checkpoint_basic(void)
@@ -1346,6 +1432,7 @@ int main(void)
     failures();
     creation();
     format_cases();
+    database_status();
     checkpoint_basic();
     checkpoint_boundaries();
     checkpoint_format();

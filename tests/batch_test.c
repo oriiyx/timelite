@@ -107,6 +107,23 @@ static void same_cursor(const struct timelite_batches *a, const struct timelite_
     assert(a->private_failed == b->private_failed);
 }
 
+static void status_values(struct timelite_batches *db, uint64_t committed,
+                          uint64_t installed, uint64_t segments,
+                          uint64_t wal, uint64_t bytes, uint64_t timestamp)
+{
+    struct timelite_batches_status status;
+    unsigned char before[sizeof(*db)];
+    memcpy(before, db, sizeof(*db));
+    assert(timelite_batches_get_status(db, &status) == 0);
+    assert(status.committed_batches == committed);
+    assert(status.installed_batches == installed);
+    assert(status.pending_batches == committed - installed);
+    assert(status.installed_segments == segments);
+    assert(status.wal_bytes == wal && status.installed_bytes == bytes);
+    assert(status.last_timestamp_us == timestamp);
+    assert(memcmp(before, db, sizeof(*db)) == 0);
+}
+
 static void time_ranges(const char *path, const char *wal_path)
 {
     struct timelite_batches db, before;
@@ -125,6 +142,7 @@ static void time_ranges(const char *path, const char *wal_path)
                                       scratch, sizeof(scratch)) == EBADF);
     assert(timelite_batches_open(&db, path, wal_path, TIMELITE_CREATE_NEW,
                                 scratch, sizeof(scratch)) == 0);
+    status_values(&db, 0, 0, 0, 32, 0, 0);
     assert(timelite_batches_seek(&db, 0, scratch, sizeof(scratch)) == TIMELITE_END);
     assert(timelite_batches_next_range(&db, &range, output, 3, &count, &sequence,
                                       scratch, sizeof(scratch)) == TIMELITE_END);
@@ -141,6 +159,7 @@ static void time_ranges(const char *path, const char *wal_path)
     same_cursor(&db, &before);
     assert(sequence == 1 && db.private_sequence == 1);
     assert(timelite_batches_checkpoint(&db, scratch, sizeof(scratch)) == 0);
+    status_values(&db, 1, 1, 1, 32, 188, 20);
     input[0].timestamp_us = 30;
     input[1].timestamp_us = 40;
     assert(timelite_batches_append(&db, input, 2, scratch, sizeof(scratch), &sequence) == 0);
@@ -150,6 +169,7 @@ static void time_ranges(const char *path, const char *wal_path)
     assert(timelite_batches_close(&db) == 0);
     assert(timelite_batches_open(&db, path, wal_path, TIMELITE_OPEN_EXISTING,
                                 scratch, sizeof(scratch)) == 0);
+    status_values(&db, 3, 2, 2, 116, 356, 50);
     input[0].timestamp_us = 49;
     before = db;
     assert(timelite_batches_append(&db, input, 1, scratch, sizeof(scratch), &sequence) == TIMELITE_OUT_OF_ORDER);

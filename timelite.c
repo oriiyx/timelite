@@ -1093,6 +1093,29 @@ static int batch_ready(struct timelite_batches *db)
     return db->private_failed ? TIMELITE_RECOVERY_REQUIRED : 0;
 }
 
+int timelite_batches_get_status(struct timelite_batches *db,
+                                struct timelite_batches_status *status)
+{
+    int error;
+    if (status == NULL)
+    {
+        return EINVAL;
+    }
+    error = batch_ready(db);
+    if (error != 0)
+    {
+        return error;
+    }
+    status->committed_batches = db->private_sequence;
+    status->installed_batches = db->private_installed;
+    status->pending_batches = db->private_sequence - db->private_installed;
+    status->installed_segments = db->private_generation;
+    status->wal_bytes = db->private_end;
+    status->installed_bytes = db->private_data_end - TIMELITE_DATA_START;
+    status->last_timestamp_us = db->private_last_time;
+    return 0;
+}
+
 int timelite_batches_append(struct timelite_batches *db,
                             const struct timelite_record *records, size_t count,
                             void *scratch, size_t scratch_size, uint64_t *sequence)

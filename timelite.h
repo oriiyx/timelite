@@ -111,6 +111,27 @@ struct timelite_batches
     int private_failed;
 };
 
+/* Logical committed data, not physical allocation or orphan bytes.
+ * Existing WAL and database capacity constants remain the limits. */
+struct timelite_batches_status
+{
+    uint64_t committed_batches; /* Total committed batch count. */
+    uint64_t installed_batches; /* Batches installed in the main file. */
+    uint64_t pending_batches; /* Committed batches still in the WAL. */
+    uint64_t installed_segments;
+    uint64_t wal_bytes; /* Committed WAL extent, including its 32-byte header. */
+    uint64_t installed_bytes; /* Segment headers and frames, excluding prefix. */
+    uint64_t last_timestamp_us; /* Zero when empty; check committed_batches. */
+};
+
+/* Uses handle metadata only: no I/O, scratch, allocation or scans.
+ * NULL arguments return EINVAL, closed handles EBADF, poisoned handles
+ * TIMELITE_RECOVERY_REQUIRED. Errors leave output unchanged. Success preserves
+ * ownership, cursor and database state. Status and handle must not overlap;
+ * calls follow the same serialized ownership contract as other batch APIs. */
+int timelite_batches_get_status(struct timelite_batches *db,
+                                struct timelite_batches_status *status);
+
 int timelite_batches_init(struct timelite_batches *db);
 /* Explicit distinct trusted paths, stable through close. Directory ancestry must
  * already be durable. Always re-establishes file and directory durability, even
