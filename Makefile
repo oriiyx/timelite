@@ -12,7 +12,7 @@ LDLIBS =
 
 .PHONY: all check clean
 
-all: build/libtimelite.a build/basic build/batches build/continuous
+all: build/libtimelite.a build/basic build/batches build/continuous build/timelite-inspect
 
 check: all
 	CC="$(CC)" AR="$(AR)" CPPFLAGS="$(CPPFLAGS)" CFLAGS="$(CFLAGS)" \
@@ -28,7 +28,7 @@ build:
 FLAGS_LINE = $(CC) | $(AR) | $(CPPFLAGS) | $(WARNINGS) $(CFLAGS) | $(LDFLAGS) | $(LDLIBS)
 FLAGS_CHECK := $(shell mkdir -p build; printf '%s\n' '$(FLAGS_LINE)' > build/flags.new; \
 	if cmp -s build/flags.new build/flags; then rm -f build/flags.new; \
-	else rm -f build/*.o build/libtimelite.a build/basic build/batches build/continuous; mv build/flags.new build/flags; fi)
+	else rm -f build/*.o build/libtimelite.a build/basic build/batches build/continuous build/timelite-inspect; mv build/flags.new build/flags; fi)
 
 build/timelite.o: timelite.c timelite.h file_io.h Makefile
 	$(CC) $(CPPFLAGS) -I. $(WARNINGS) $(CFLAGS) -c timelite.c -o $@
@@ -47,6 +47,10 @@ build/batches: examples/batches.c timelite.h build/libtimelite.a Makefile
 
 build/continuous: examples/continuous.c timelite.h build/libtimelite.a Makefile
 	$(CC) $(CPPFLAGS) -I. $(WARNINGS) $(CFLAGS) $(LDFLAGS) examples/continuous.c build/libtimelite.a $(LDLIBS) -o $@
+
+# Offline inspection tool (feature 012): verify is read-only, status recovers.
+build/timelite-inspect: tools/inspect/inspect.c timelite.h build/libtimelite.a Makefile
+	$(CC) $(CPPFLAGS) -I. $(WARNINGS) $(CFLAGS) $(LDFLAGS) tools/inspect/inspect.c build/libtimelite.a $(LDLIBS) -o $@
 
 clean:
 	rm -rf build

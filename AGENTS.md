@@ -17,7 +17,11 @@ survive expiration. General compaction and per-series indexes remain deferred. F
 time-range count/minimum/maximum aggregation without changing the read cursor.
 Batch operations use caller-owned scratch, integer records and serialized ownership.
 Feature 011 adds a continuous-operation example and bounded integration workload;
-application policy and scheduling remain outside the library.
+application policy and scheduling remain outside the library. Feature 012 adds
+tools/inspect, an offline command-line tool: `verify` parses a database/WAL
+pair read-only with stdio and predicts recovery, `status` opens it through the
+public API (which recovers). The tool reports and never repairs; its format
+constants are copies of timelite.c checked by the `inspect` inventory test.
 Durable provisioning is implemented for selected local Linux/macOS filesystems;
 Windows batch provisioning explicitly returns ENOTSUP. v1 creation retains its
 original file-sync-only contract. No automatic format migration is provided.
