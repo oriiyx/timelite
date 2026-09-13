@@ -23,7 +23,8 @@ the test runner, never by the library), then run:
 make check
 ```
 
-This builds build/libtimelite.a, build/basic, build/batches and build/continuous with Make, then
+This builds build/libtimelite.a, build/basic, build/batches, build/continuous
+and build/timelite-inspect with Make, then
 runs the native test profile through the runner (see Testing). The basic example prints:
 
 ```text
@@ -593,6 +594,106 @@ failure boundaries, official durability sources, and separate verification
 results, and [feature 006](docs/feature/006-checkpoint.md) for the checkpoint
 layout and protocol.
 
+## Inspecting a database after a crash
+
+`build/timelite-inspect` checks a database/WAL pair from the shell. It has two
+modes, and the difference matters:
+
+- `verify DATABASE WAL` is **read-only**. It parses both files with plain
+  stdio, never opens them through the library, and never writes, truncates,
+  syncs or creates anything. It reports what is on disk and states what the
+  library's recovery would do, without doing it.
+- `status DATABASE WAL` **recovers**. It opens the pair with the public API
+  (`TIMELITE_OPEN_EXISTING`), which performs the normal recovery: an
+  incomplete WAL suffix is truncated, an interrupted reclaim or retention is
+  finished, and both files are re-provisioned. It then prints the
+  `timelite_batches_status` fields. `--dump` prints one line per record;
+  `--from-us N`, `--until-us N` (half-open) and `--series N` filter the dump.
+
+Run `verify` first. Run `status` only when you accept that recovery changes
+the files. Exit codes for both modes: 0 coherent, 1 inconsistency found, 2
+usage or I/O error (including the library's `ENOTSUP` on Windows, where no
+pair can be opened). Output is one fact per line as `key=value`, stable for
+grep; indexed facts use dotted keys such as `segment.1.offset`.
+
+Recoverable crash artifacts are coherent (exit 0) and appear under
+`recovery.*` and `*_trailing_bytes`: an incomplete final WAL frame, a stale
+WAL after an interrupted reclaim, orphan bytes after an interrupted install,
+and an interrupted retention phase. Damage exits 1: checksum mismatches,
+invalid nonzero manifest slots, sequence or link errors, 1..31 ambiguous
+bytes at the end of the WAL, a v1 file, a mismatched pair. Every
+inconsistency lists its file, offset and detail. The `predicted.*` lines use
+the same keys that `status` prints, so the two can be compared directly.
+
+Example `verify` after a crash cut an append in the middle of its frame
+(exit 0; the abridged output keeps the lines an operator reads first):
+
+```text
+mode=verify
+read_only=1
+database_size=308
+wal_size=100
+pair_identity=match
+slot.0.state=valid
+slot.1.state=valid
+active_slot=1
+manifest_kind=install-007
+generation=1
+installed_last_sequence=1
+database_logical_end=308
+segment.1.offset=160
+segment.1.kind=TLSPAN07
+segment.1.first_sequence=1
+segment.1.last_sequence=1
+segment.1.frames_read=1
+wal_incomplete_suffix_offset=32
+wal_incomplete_suffix_bytes=68
+wal_frames=0
+pending_batches=0
+committed_batches=1
+timestamp_floor_us=1700000000000000
+database_trailing_bytes=0
+wal_trailing_bytes=68
+recovery.result=ok
+recovery.manifest_slot=1
+recovery.wal_truncate_to=32
+recovery.wal_action=truncate the incomplete final frame; no committed batch is lost
+recovery.retention_action=none
+predicted.committed_batches=1
+predicted.wal_bytes=32
+inconsistencies=0
+```
+
+Example `status --dump` on the same pair (exit 0; the open truncated the WAL
+to 32 bytes exactly as predicted):
+
+```text
+mode=status
+read_only=0
+note=status opens the pair with the library; open performs normal recovery (WAL suffix truncation, reclaim or retention finish)
+open_result=ok
+committed_batches=1
+installed_batches=1
+pending_batches=0
+installed_segments=1
+wal_bytes=32
+installed_bytes=148
+last_timestamp_us=1700000000000000
+batch=1 series=7 us=1700000000000000 value=23500
+```
+
+When `recovery.result` is not `ok`, `verify` names the library error the open
+would return (for example `TIMELITE_INVALID_DATABASE` for a damaged committed
+frame, `TIMELITE_PAIR_MISMATCH` for files from different pairs) and
+`recovery.fails_at` names the check; the library then changes neither file.
+A damaged installed frame leaves the open succeeding and is reported as
+`first_unreadable_sequence`; `status --dump` stops there with `read_error`.
+The tool never repairs, rewrites or migrates anything; it has no format
+knowledge of its own beyond constants copied from timelite.c, which the
+`inspect` test checks against pairs the real library produced. Paths are
+passed to `fopen` as given, so non-ASCII paths on Windows are not supported by
+`verify`. See [feature 012](docs/feature/012-inspect-tool.md).
+
 ## Database lifecycle
 
 Initialize caller-owned storage before using it. Open handles have one owner and
@@ -697,6 +798,8 @@ are in [feature 001](docs/feature/001-file-io.md).
 - tests/: temporary-file, deterministic fault, model and storage probe tests.
 - tools/test.py, tools/inventory.json, tools/test_runner.py, tools/docker/:
   test runner, shared inventory, runner self-tests and the toolchain image.
+- tools/inspect/inspect.c: the offline inspection tool built as
+  build/timelite-inspect (read-only `verify`, recovering `status`).
 - examples/basic.c: a small application that calls the library.
 - examples/batches.c: complete v2 create/append/checkpoint/reopen/seek/window application.
 - examples/continuous.c: application-controlled status, checkpoint, export,
@@ -710,6 +813,8 @@ are in [feature 001](docs/feature/001-file-io.md).
   continuous-operation integration, release evidence and results.
 
 - [docs/feature/007-time-range.md](docs/feature/007-time-range.md): time spans, seek, filtered reads and verification.
+- [docs/feature/012-inspect-tool.md](docs/feature/012-inspect-tool.md): offline
+  inspection tool, its read-only/recovering split, output keys and results.
 
 ## Contributions
 

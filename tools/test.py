@@ -81,7 +81,7 @@ def source_files(root):
     names = ['timelite.c', 'timelite.h', 'file_io.c', 'file_io_windows.c', 'file_io.h',
              'Makefile', 'README.md', 'AGENTS.md', 'CLAUDE.md', 'LICENSE', '.gitignore']
     directories = [('tests', {'.c', '.h'}), ('examples', {'.c'}),
-                   ('tools', {'.py', '.json', '.md', '.txt', ''}),
+                   ('tools', {'.py', '.json', '.md', '.txt', '.c', '.h', ''}),
                    ('docs/feature', {'.md'}), ('.github/workflows', {'.yml', '.yaml'})]
     paths = [root / n for n in names if (root / n).exists()]
     for directory, suffixes in directories:

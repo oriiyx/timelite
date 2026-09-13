@@ -30,7 +30,11 @@ the read cursor. Feature 010 adds explicit whole-segment retention with durable
 tail/front copies, recovery phases and preserved sequence/timestamp high-water
 marks. Feature 005 is the repeatable testing suite. Feature 011 demonstrates the
 application-controlled continuous-operation loop without adding automatic policy
-or scheduling. Keep the internal native file layer separate from public APIs.
+or scheduling. Feature 012 is tools/inspect (build/timelite-inspect): `verify`
+is read-only stdio parsing that predicts recovery, `status` uses the public API
+and recovers on open; it never repairs and adds no public API. Keep format
+knowledge in timelite.c; the tool's copied constants are checked by the
+`inspect` test. Keep the internal native file layer separate from public APIs.
 Preserve Windows library/backend tests and the batch model; Windows namespace
 provisioning is unsupported and must return ENOTSUP without a weaker fallback.
 Use AGENTS.md, feature 004, feature 006, feature 007 and feature 010 for the qualified durability, memory,

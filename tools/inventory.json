@@ -34,5 +34,8 @@
    "coverage": "native batch behavior, checkpoint, capacity, truncation prefixes and corruption"},
   {"name": "batch_model", "source": "tests/batch_model_test.c", "backend": "fake",
    "platforms": ["posix", "windows"],
-   "coverage": "deterministic volatile/persisted model with exhaustive append and checkpoint interruption boundaries"}
+   "coverage": "deterministic volatile/persisted model with exhaustive append and checkpoint interruption boundaries"},
+  {"name": "inspect", "source": "tests/inspect_test.c", "backend": "fake",
+   "platforms": ["posix", "windows"], "execution": "batch",
+   "coverage": "offline inspection tool: read-only verify on synthetic and library-made pairs, recovery prediction agreement with status"}
 ]
