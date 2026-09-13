@@ -10,8 +10,8 @@ globally ordered append, indexed segment seek and explicit checkpointing
 as immutable segments behind a two-slot generation manifest, and the WAL is
 truncated only after that install is durable. The WAL is capped at 64 MiB and
 the main file at 1 GiB; checkpoint is manual and never automatic. Feature 005 is
-the repeatable testing suite. Retention, compaction, per-series indexes and aggregation remain
-deferred.
+the repeatable testing suite. Retention, compaction, per-series indexes remain deferred. Feature 009 adds scanning
+time-range count/minimum/maximum aggregation without changing the read cursor.
 Batch operations use caller-owned scratch, integer records and serialized ownership.
 Durable provisioning is implemented for selected local Linux/macOS filesystems;
 Windows batch provisioning explicitly returns ENOTSUP. v1 creation retains its

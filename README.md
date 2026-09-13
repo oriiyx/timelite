@@ -306,8 +306,36 @@ open handle or externally modify, rename, replace or delete its files/directorie
 The WAL limit is 64 MiB including its 32-byte header. A batch occupies
 64 + 20 × record count bytes (84..1344). `TIMELITE_WAL_FULL` rejects a batch
 before writes; committed WAL data is never overwritten and is reclaimed only by
-checkpoint. There is no rotation, retention, compaction, aggregation or
+checkpoint. There is no rotation, retention, compaction or
 per-series index.
+
+### Time-range aggregation
+
+```c
+struct timelite_range window = {0, 1000000, 7, 1};
+struct timelite_aggregate summary;
+int error = timelite_batches_aggregate_range(&db, &window, &summary,
+                                             scratch, sizeof(scratch));
+if (error == 0 && summary.record_count != 0)
+{
+    printf("records=%" PRIu64 ", minimum=%" PRId64 ", maximum=%" PRId64 "\n",
+           summary.record_count, summary.minimum_value, summary.maximum_value);
+}
+```
+
+Aggregation counts matching records across installed segments and pending WAL
+batches in `[from_us, until_us)`, independently of the current cursor, even at
+END. Empty intervals and no matches succeed with all fields zero; use
+`record_count` to distinguish empty results from real zero values. Combining
+series combines their values, so choose a series filter when units differ.
+Success and errors preserve the handle, cursor and file ownership; errors leave
+`summary` unchanged. Scratch may change, and the range reader's argument,
+scratch-size, closed/poisoned handle and corruption/read-error rules apply.
+The scan uses bounded local memory and caller-owned scratch, with no writes,
+allocations or retained buffers. It scans candidate data from the beginning
+(with existing ordered upper-bound stopping), including legacy unordered data;
+there are no precomputed summaries or constant-time query guarantees.
+See [Feature 009](docs/feature/009-range-aggregation.md).
 
 ### Database status
 

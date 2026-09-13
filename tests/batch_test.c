@@ -263,6 +263,67 @@ static void time_ranges(const char *path, const char *wal_path)
     assert(remove_test_file(wal_path) == 0);
 }
 
+static void aggregate_ranges(const char *path, const char *wal_path)
+{
+    struct timelite_batches db, before;
+    struct timelite_record records[] = {{7, 0, INT64_MIN}, {8, 0, INT64_MAX},
+                                        {7, 10, -5}, {7, 10, 0}, {8, 20, 9}};
+    struct timelite_range range = {0, 21, 0, 0};
+    struct timelite_aggregate result;
+    unsigned char scratch[TIMELITE_BATCH_SCRATCH];
+    uint64_t sequence;
+    int phase;
+    TEST_CASE("aggregate empty database", 0);
+    assert(timelite_batches_init(&db) == 0);
+    assert(timelite_batches_open(&db, path, wal_path, TIMELITE_CREATE_NEW,
+                                scratch, sizeof(scratch)) == 0);
+    assert(timelite_batches_aggregate_range(&db, &range, &result, scratch, sizeof(scratch)) == 0);
+    assert(result.record_count == 0 && result.minimum_value == 0 && result.maximum_value == 0);
+    assert(timelite_batches_append(&db, records, 2, scratch, sizeof(scratch), &sequence) == 0);
+    assert(timelite_batches_checkpoint(&db, scratch, sizeof(scratch)) == 0);
+    assert(timelite_batches_append(&db, records + 2, 2, scratch, sizeof(scratch), &sequence) == 0);
+    assert(timelite_batches_checkpoint(&db, scratch, sizeof(scratch)) == 0);
+    assert(timelite_batches_append(&db, records + 4, 1, scratch, sizeof(scratch), &sequence) == 0);
+    for (phase = 0; phase < 3; phase++)
+    {
+        TEST_CASE("aggregate segments WAL checkpoint reopen", phase);
+        if (phase == 1)
+        {
+            assert(timelite_batches_checkpoint(&db, scratch, sizeof(scratch)) == 0);
+        }
+        if (phase == 2)
+        {
+            assert(timelite_batches_close(&db) == 0);
+            assert(timelite_batches_open(&db, path, wal_path, TIMELITE_OPEN_EXISTING,
+                                        scratch, sizeof(scratch)) == 0);
+        }
+        assert(timelite_batches_seek(&db, phase == 0 ? 10 : 99, scratch, sizeof(scratch)) ==
+               (phase == 0 ? 0 : TIMELITE_END));
+        before = db;
+        range.from_us = 0;
+        range.until_us = 21;
+        range.filter_series = 0;
+        assert(timelite_batches_aggregate_range(&db, &range, &result, scratch, sizeof(scratch)) == 0);
+        assert(result.record_count == 5 && result.minimum_value == INT64_MIN && result.maximum_value == INT64_MAX);
+        range.until_us = 20;
+        range.from_us = 10;
+        range.filter_series = 1;
+        range.series = 7;
+        assert(timelite_batches_aggregate_range(&db, &range, &result, scratch, sizeof(scratch)) == 0);
+        assert(result.record_count == 2 && result.minimum_value == -5 && result.maximum_value == 0);
+        range.series = 8;
+        assert(timelite_batches_aggregate_range(&db, &range, &result, scratch, sizeof(scratch)) == 0);
+        assert(result.record_count == 0 && result.minimum_value == 0 && result.maximum_value == 0);
+        range.from_us = 20;
+        assert(timelite_batches_aggregate_range(&db, &range, &result, scratch, sizeof(scratch)) == 0);
+        assert(result.record_count == 0 && result.minimum_value == 0 && result.maximum_value == 0);
+        assert(memcmp(&db, &before, sizeof(db)) == 0);
+    }
+    assert(timelite_batches_close(&db) == 0);
+    assert(remove_test_file(path) == 0);
+    assert(remove_test_file(wal_path) == 0);
+}
+
 static void legacy_range(const char *path, const char *wal_path)
 {
     /* Exact 006 golden manifest and segment; frame retained from the same
@@ -591,6 +652,7 @@ int main(void)
     }
     assert(remove_test_file(path) == 0);
     assert(remove_test_file(wal_path) == 0);
+    aggregate_ranges(path, wal_path);
     time_ranges(path, wal_path);
     legacy_range(path, wal_path);
     assert(timelite_init(&legacy) == 0);

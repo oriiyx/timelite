@@ -1739,3 +1739,57 @@ int timelite_batches_next_range(struct timelite_batches *db,
         }
     }
 }
+
+int timelite_batches_aggregate_range(struct timelite_batches *db,
+                                     const struct timelite_range *range,
+                                     struct timelite_aggregate *result,
+                                     void *scratch, size_t scratch_size)
+{
+    struct timelite_batches cursor;
+    struct timelite_aggregate aggregate = {0, 0, 0};
+    struct timelite_record records[TIMELITE_MAX_RECORDS];
+    size_t count, i;
+    uint64_t sequence;
+    int error = batch_ready(db);
+    if (error != 0)
+    {
+        return error;
+    }
+    if (range == NULL || range->from_us > range->until_us ||
+        (range->filter_series != 0 && range->filter_series != 1) || result == NULL)
+    {
+        return EINVAL;
+    }
+    error = read_arguments(db, scratch, scratch_size);
+    if (error != 0)
+    {
+        return error;
+    }
+    /* Borrow files without acquiring or releasing ownership. Rewind also
+     * covers legacy unordered batches that a last-record seek could skip. */
+    cursor = *db;
+    reset_cursor(&cursor);
+    while ((error = timelite_batches_next_range(&cursor, range, records,
+             TIMELITE_MAX_RECORDS, &count, &sequence, scratch, scratch_size)) == 0)
+    {
+        for (i = 0; i < count; i++)
+        {
+            if (aggregate.record_count == 0 || records[i].value < aggregate.minimum_value)
+            {
+                aggregate.minimum_value = records[i].value;
+            }
+            if (aggregate.record_count == 0 || records[i].value > aggregate.maximum_value)
+            {
+                aggregate.maximum_value = records[i].value;
+            }
+            /* File capacity bounds the number of records well below UINT64_MAX. */
+            aggregate.record_count++;
+        }
+    }
+    if (error != TIMELITE_END)
+    {
+        return error;
+    }
+    *result = aggregate;
+    return 0;
+}

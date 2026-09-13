@@ -25,7 +25,8 @@ append, recovery, sequential reading over installed segments plus the WAL,
 global timestamp order, segment seek and filtered time-range reads (feature 007), and
 manual checkpointing with safe WAL reclamation (feature 006: segments behind a
 two-slot generation manifest, WAL truncated only after the install is durable).
-Feature 005 is the repeatable testing suite. Keep the internal native file layer
+Feature 009 adds time-range count/minimum/maximum aggregation independent of
+the read cursor. Feature 005 is the repeatable testing suite. Keep the internal native file layer
 separate from public APIs.
 Preserve Windows library/backend tests and the batch model; Windows namespace
 provisioning is unsupported and must return ENOTSUP without a weaker fallback.

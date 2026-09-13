@@ -181,7 +181,7 @@ int timelite_batches_next(struct timelite_batches *db,
                           size_t *count, uint64_t *sequence,
                           void *scratch, size_t scratch_size);
 /* Caller-owned, not retained. Half-open interval; filter_series must be 0 or 1.
- * from_us > until_us is EINVAL; equal endpoints give END. */
+ * from_us > until_us is EINVAL; equal endpoints give END for next_range, zero totals for aggregation. */
 struct timelite_range
 {
     uint64_t from_us;
@@ -206,6 +206,24 @@ int timelite_batches_next_range(struct timelite_batches *db,
                                 struct timelite_record *records, size_t capacity,
                                 size_t *count, uint64_t *sequence,
                                 void *scratch, size_t scratch_size);
+struct timelite_aggregate
+{
+    uint64_t record_count;
+    int64_t minimum_value;
+    int64_t maximum_value;
+};
+
+/* Summarize the entire range independently of the read cursor. Success and
+ * errors preserve the handle, cursor and ownership; errors preserve result.
+ * Empty intervals/no matches succeed with all fields zero. Count is records,
+ * not batches. Combining series combines values: filter when units differ.
+ * Same argument, scratch, closed/poisoned and read-error rules as next_range.
+ * Scratch may change. Scans candidate data, with no precomputed summaries or
+ * constant-time promise. No writes, allocation or retained buffers. */
+int timelite_batches_aggregate_range(struct timelite_batches *db,
+                                     const struct timelite_range *range,
+                                     struct timelite_aggregate *result,
+                                     void *scratch, size_t scratch_size);
 int timelite_batches_rewind(struct timelite_batches *db);
 /* Consumes both resources even if one close fails; returns first error. */
 int timelite_batches_close(struct timelite_batches *db);
