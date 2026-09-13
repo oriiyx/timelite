@@ -131,6 +131,341 @@ static void status_values(struct timelite_batches *db, uint64_t committed,
     assert(memcmp(before, db, sizeof(*db)) == 0);
 }
 
+#define CONTINUOUS_BATCHES 16
+
+struct model_batch
+{
+    struct timelite_record records[2];
+    size_t count;
+    uint64_t sequence;
+    unsigned int segment;
+    int installed;
+    int live;
+};
+
+struct continuous_model
+{
+    struct model_batch batches[CONTINUOUS_BATCHES];
+    size_t count;
+    unsigned int next_segment;
+    uint64_t last_timestamp_us;
+};
+
+static int same_record(const struct timelite_record *left,
+                       const struct timelite_record *right)
+{
+    return left->series == right->series &&
+           left->timestamp_us == right->timestamp_us &&
+           left->value == right->value;
+}
+
+static void model_append(struct continuous_model *model,
+                         const struct timelite_record *records, size_t count)
+{
+    struct model_batch *batch = &model->batches[model->count];
+    size_t i;
+    assert(model->count < CONTINUOUS_BATCHES && count <= 2);
+    for (i = 0; i < count; i++)
+    {
+        batch->records[i] = records[i];
+    }
+    batch->count = count;
+    batch->sequence = model->count + 1;
+    batch->segment = 0;
+    batch->installed = 0;
+    batch->live = 1;
+    model->last_timestamp_us = records[count - 1].timestamp_us;
+    model->count++;
+}
+
+static void model_checkpoint(struct continuous_model *model)
+{
+    size_t i;
+    int pending = 0;
+    for (i = 0; i < model->count; i++)
+    {
+        pending |= model->batches[i].live && !model->batches[i].installed;
+    }
+    if (!pending)
+    {
+        return;
+    }
+    model->next_segment++;
+    for (i = 0; i < model->count; i++)
+    {
+        if (model->batches[i].live && !model->batches[i].installed)
+        {
+            model->batches[i].installed = 1;
+            model->batches[i].segment = model->next_segment;
+        }
+    }
+}
+
+static void model_expire(struct continuous_model *model, uint64_t cutoff_us)
+{
+    unsigned int segment;
+    size_t i, j;
+    uint64_t maximum;
+    int found;
+    for (i = 0; i < model->count; i++)
+    {
+        segment = model->batches[i].segment;
+        if (!model->batches[i].live || !model->batches[i].installed)
+        {
+            continue;
+        }
+        found = 0;
+        maximum = 0;
+        for (j = 0; j < model->count; j++)
+        {
+            if (model->batches[j].live && model->batches[j].segment == segment)
+            {
+                uint64_t last = model->batches[j].records[model->batches[j].count - 1].timestamp_us;
+                if (!found || last > maximum)
+                {
+                    maximum = last;
+                }
+                found = 1;
+            }
+        }
+        if (found && maximum < cutoff_us)
+        {
+            for (j = 0; j < model->count; j++)
+            {
+                if (model->batches[j].live && model->batches[j].segment == segment)
+                {
+                    model->batches[j].live = 0;
+                }
+            }
+        }
+    }
+}
+
+static void verify_continuous_model(struct timelite_batches *db,
+                                    const struct continuous_model *model,
+                                    unsigned char *scratch)
+{
+    struct timelite_batches_status status;
+    struct timelite_record output[2];
+    struct timelite_range range = {20, 41, 7, 1};
+    struct timelite_aggregate aggregate;
+    uint64_t committed = 0, installed = 0, pending = 0, installed_bytes = 0;
+    uint64_t wal_bytes = 32, sequence = UINT64_MAX, expected_count = 0;
+    int64_t expected_minimum = 0, expected_maximum = 0;
+    unsigned int segments = 0, seen[CONTINUOUS_BATCHES] = {0};
+    size_t count = SIZE_MAX, i, j, matches;
+    int error;
+    for (i = 0; i < model->count; i++)
+    {
+        const struct model_batch *batch = &model->batches[i];
+        if (!batch->live)
+        {
+            continue;
+        }
+        committed++;
+        if (batch->installed)
+        {
+            installed++;
+            installed_bytes += 64 + 20 * batch->count;
+            if (!seen[batch->segment])
+            {
+                seen[batch->segment] = 1;
+                segments++;
+                installed_bytes += 64;
+            }
+        }
+        else
+        {
+            pending++;
+            wal_bytes += 64 + 20 * batch->count;
+        }
+    }
+    assert(timelite_batches_get_status(db, &status) == 0);
+    assert(status.committed_batches == committed);
+    assert(status.installed_batches == installed);
+    assert(status.pending_batches == pending);
+    assert(status.installed_segments == segments);
+    assert(status.wal_bytes == wal_bytes);
+    assert(status.installed_bytes == installed_bytes);
+    assert(status.last_timestamp_us == model->last_timestamp_us);
+    assert(timelite_batches_rewind(db) == 0);
+    for (i = 0; i < model->count; i++)
+    {
+        const struct model_batch *batch = &model->batches[i];
+        if (!batch->live)
+        {
+            continue;
+        }
+        assert(timelite_batches_next(db, output, 2, &count, &sequence,
+                                    scratch, TIMELITE_BATCH_SCRATCH) == 0);
+        assert(sequence == batch->sequence && count == batch->count);
+        for (j = 0; j < count; j++)
+        {
+            assert(same_record(output + j, batch->records + j));
+        }
+    }
+    count = SIZE_MAX;
+    sequence = UINT64_MAX;
+    assert(timelite_batches_next(db, output, 2, &count, &sequence,
+                                scratch, TIMELITE_BATCH_SCRATCH) == TIMELITE_END);
+    assert(count == SIZE_MAX && sequence == UINT64_MAX);
+    error = timelite_batches_seek(db, range.from_us, scratch, TIMELITE_BATCH_SCRATCH);
+    for (i = 0; i < model->count; i++)
+    {
+        const struct model_batch *batch = &model->batches[i];
+        if (!batch->live)
+        {
+            continue;
+        }
+        matches = 0;
+        for (j = 0; j < batch->count; j++)
+        {
+            const struct timelite_record *record = batch->records + j;
+            if (record->series == range.series && record->timestamp_us >= range.from_us &&
+                record->timestamp_us < range.until_us)
+            {
+                if (expected_count == 0 || record->value < expected_minimum)
+                {
+                    expected_minimum = record->value;
+                }
+                if (expected_count == 0 || record->value > expected_maximum)
+                {
+                    expected_maximum = record->value;
+                }
+                expected_count++;
+                matches++;
+            }
+        }
+        if (matches == 0)
+        {
+            continue;
+        }
+        assert(error == 0);
+        assert(timelite_batches_next_range(db, &range, output, 2, &count, &sequence,
+                                           scratch, TIMELITE_BATCH_SCRATCH) == 0);
+        assert(sequence == batch->sequence && count == matches);
+        matches = 0;
+        for (j = 0; j < batch->count; j++)
+        {
+            const struct timelite_record *record = batch->records + j;
+            if (record->series == range.series && record->timestamp_us >= range.from_us &&
+                record->timestamp_us < range.until_us)
+            {
+                assert(same_record(output + matches, record));
+                matches++;
+            }
+        }
+    }
+    if (expected_count == 0)
+    {
+        assert(error == TIMELITE_END);
+    }
+    else
+    {
+        assert(timelite_batches_next_range(db, &range, output, 2, &count, &sequence,
+                                           scratch, TIMELITE_BATCH_SCRATCH) == TIMELITE_END);
+    }
+    assert(timelite_batches_aggregate_range(db, &range, &aggregate, scratch,
+                                            TIMELITE_BATCH_SCRATCH) == 0);
+    assert(aggregate.record_count == expected_count);
+    assert(aggregate.minimum_value == expected_minimum);
+    assert(aggregate.maximum_value == expected_maximum);
+}
+
+static void continuous_operation(const char *path, const char *wal_path)
+{
+    struct timelite_batches db;
+    struct continuous_model model = {0};
+    struct timelite_record batch[2], output[2];
+    unsigned char scratch[TIMELITE_BATCH_SCRATCH];
+    uint64_t sequence;
+    size_t count;
+    int step = 0;
+#define APPEND_MODEL(record_count) do { \
+    TEST_CASE("continuous append", step++); \
+    assert(timelite_batches_append(&db, batch, (record_count), scratch, sizeof(scratch), \
+                                   &sequence) == 0); \
+    model_append(&model, batch, (record_count)); \
+    assert(sequence == model.count); \
+} while (0)
+#define CHECKPOINT_MODEL() do { \
+    TEST_CASE("continuous checkpoint", step++); \
+    assert(timelite_batches_checkpoint(&db, scratch, sizeof(scratch)) == 0); \
+    model_checkpoint(&model); \
+} while (0)
+#define EXPIRE_MODEL(cutoff) do { \
+    TEST_CASE("continuous retention", step++); \
+    assert(timelite_batches_expire_before(&db, (cutoff), scratch, sizeof(scratch)) == 0); \
+    model_expire(&model, (cutoff)); \
+} while (0)
+    TEST_CASE("continuous create", step++);
+    assert(timelite_batches_init(&db) == 0);
+    assert(timelite_batches_open(&db, path, wal_path, TIMELITE_CREATE_NEW,
+                                scratch, sizeof(scratch)) == 0);
+    batch[0] = (struct timelite_record){7, 10, 100};
+    batch[1] = (struct timelite_record){8, 10, 101};
+    APPEND_MODEL(2);
+    batch[0] = (struct timelite_record){7, 20, 200};
+    APPEND_MODEL(1);
+    CHECKPOINT_MODEL();
+    batch[0] = (struct timelite_record){7, 20, 300};
+    batch[1] = (struct timelite_record){7, 25, 301};
+    APPEND_MODEL(2);
+    batch[0] = (struct timelite_record){8, 30, 400};
+    APPEND_MODEL(1);
+    CHECKPOINT_MODEL();
+    batch[0] = (struct timelite_record){7, 30, 500};
+    APPEND_MODEL(1);
+    verify_continuous_model(&db, &model, scratch);
+    assert(timelite_batches_close(&db) == 0);
+    assert(timelite_batches_open(&db, path, wal_path, TIMELITE_OPEN_EXISTING,
+                                scratch, sizeof(scratch)) == 0);
+    verify_continuous_model(&db, &model, scratch);
+    EXPIRE_MODEL(21);
+    verify_continuous_model(&db, &model, scratch);
+    batch[0] = (struct timelite_record){7, 40, 600};
+    APPEND_MODEL(1);
+    CHECKPOINT_MODEL();
+    EXPIRE_MODEL(31);
+    verify_continuous_model(&db, &model, scratch);
+    assert(timelite_batches_close(&db) == 0);
+    assert(timelite_batches_open(&db, path, wal_path, TIMELITE_OPEN_EXISTING,
+                                scratch, sizeof(scratch)) == 0);
+    verify_continuous_model(&db, &model, scratch);
+    batch[0] = (struct timelite_record){7, 40, 700};
+    APPEND_MODEL(1);
+    assert(timelite_batches_next(&db, output, 2, &count, &sequence,
+                                scratch, sizeof(scratch)) == 0);
+    assert(sequence == model.count && same_record(output, batch));
+    batch[0] = (struct timelite_record){8, 40, 800};
+    APPEND_MODEL(1);
+    assert(timelite_batches_next(&db, output, 2, &count, &sequence,
+                                scratch, sizeof(scratch)) == 0);
+    assert(sequence == model.count && same_record(output, batch));
+    CHECKPOINT_MODEL();
+    EXPIRE_MODEL(41);
+    verify_continuous_model(&db, &model, scratch);
+    batch[0] = (struct timelite_record){7, 39, 900};
+    assert(timelite_batches_append(&db, batch, 1, scratch, sizeof(scratch),
+                                  &sequence) == TIMELITE_OUT_OF_ORDER);
+    batch[0].timestamp_us = 40;
+    APPEND_MODEL(1);
+    assert(timelite_batches_next(&db, output, 2, &count, &sequence,
+                                scratch, sizeof(scratch)) == 0);
+    assert(sequence == model.count && same_record(output, batch));
+    verify_continuous_model(&db, &model, scratch);
+    assert(timelite_batches_close(&db) == 0);
+    assert(timelite_batches_open(&db, path, wal_path, TIMELITE_OPEN_EXISTING,
+                                scratch, sizeof(scratch)) == 0);
+    verify_continuous_model(&db, &model, scratch);
+    assert(timelite_batches_close(&db) == 0);
+    assert(remove_test_file(path) == 0);
+    assert(remove_test_file(wal_path) == 0);
+#undef APPEND_MODEL
+#undef CHECKPOINT_MODEL
+#undef EXPIRE_MODEL
+}
+
 static void time_ranges(const char *path, const char *wal_path)
 {
     struct timelite_batches db, before;
@@ -735,6 +1070,7 @@ int main(void)
     }
     assert(remove_test_file(path) == 0);
     assert(remove_test_file(wal_path) == 0);
+    continuous_operation(path, wal_path);
     retention_native(path, wal_path);
     aggregate_ranges(path, wal_path);
     time_ranges(path, wal_path);

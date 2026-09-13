@@ -28,8 +28,9 @@ two-slot generation manifest, WAL truncated only after the install is durable).
 Feature 009 adds time-range count/minimum/maximum aggregation independent of
 the read cursor. Feature 010 adds explicit whole-segment retention with durable
 tail/front copies, recovery phases and preserved sequence/timestamp high-water
-marks. Feature 005 is the repeatable testing suite. Keep the internal native file layer
-separate from public APIs.
+marks. Feature 005 is the repeatable testing suite. Feature 011 demonstrates the
+application-controlled continuous-operation loop without adding automatic policy
+or scheduling. Keep the internal native file layer separate from public APIs.
 Preserve Windows library/backend tests and the batch model; Windows namespace
 provisioning is unsupported and must return ENOTSUP without a weaker fallback.
 Use AGENTS.md, feature 004, feature 006, feature 007 and feature 010 for the qualified durability, memory,

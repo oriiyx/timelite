@@ -16,6 +16,8 @@ copies and recovery-phase manifests; sequence and timestamp high-water marks
 survive expiration. General compaction and per-series indexes remain deferred. Feature 009 adds scanning
 time-range count/minimum/maximum aggregation without changing the read cursor.
 Batch operations use caller-owned scratch, integer records and serialized ownership.
+Feature 011 adds a continuous-operation example and bounded integration workload;
+application policy and scheduling remain outside the library.
 Durable provisioning is implemented for selected local Linux/macOS filesystems;
 Windows batch provisioning explicitly returns ENOTSUP. v1 creation retains its
 original file-sync-only contract. No automatic format migration is provided.

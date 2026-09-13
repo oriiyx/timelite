@@ -12,7 +12,7 @@ LDLIBS =
 
 .PHONY: all check clean
 
-all: build/libtimelite.a build/basic build/batches
+all: build/libtimelite.a build/basic build/batches build/continuous
 
 check: all
 	CC="$(CC)" AR="$(AR)" CPPFLAGS="$(CPPFLAGS)" CFLAGS="$(CFLAGS)" \
@@ -28,7 +28,7 @@ build:
 FLAGS_LINE = $(CC) | $(AR) | $(CPPFLAGS) | $(WARNINGS) $(CFLAGS) | $(LDFLAGS) | $(LDLIBS)
 FLAGS_CHECK := $(shell mkdir -p build; printf '%s\n' '$(FLAGS_LINE)' > build/flags.new; \
 	if cmp -s build/flags.new build/flags; then rm -f build/flags.new; \
-	else rm -f build/*.o build/libtimelite.a build/basic build/batches; mv build/flags.new build/flags; fi)
+	else rm -f build/*.o build/libtimelite.a build/basic build/batches build/continuous; mv build/flags.new build/flags; fi)
 
 build/timelite.o: timelite.c timelite.h file_io.h Makefile
 	$(CC) $(CPPFLAGS) -I. $(WARNINGS) $(CFLAGS) -c timelite.c -o $@
@@ -44,6 +44,9 @@ build/basic: examples/basic.c timelite.h build/libtimelite.a Makefile
 
 build/batches: examples/batches.c timelite.h build/libtimelite.a Makefile
 	$(CC) $(CPPFLAGS) -I. $(WARNINGS) $(CFLAGS) $(LDFLAGS) examples/batches.c build/libtimelite.a $(LDLIBS) -o $@
+
+build/continuous: examples/continuous.c timelite.h build/libtimelite.a Makefile
+	$(CC) $(CPPFLAGS) -I. $(WARNINGS) $(CFLAGS) $(LDFLAGS) examples/continuous.c build/libtimelite.a $(LDLIBS) -o $@
 
 clean:
 	rm -rf build

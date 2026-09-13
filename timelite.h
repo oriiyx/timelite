@@ -64,7 +64,7 @@ const char *timelite_version(void);
 #define TIMELITE_MAX_RECORDS 64u
 #define TIMELITE_BATCH_SCRATCH 1344u
 #define TIMELITE_WAL_CAPACITY UINT64_C(67108864)
-/* Main database file limit including headers; checkpoint refuses to grow past it. */
+/* Main database file limit including headers and retention's temporary copy. */
 #define TIMELITE_DATABASE_CAPACITY UINT64_C(1073741824)
 #define TIMELITE_END (-3)
 #define TIMELITE_BUFFER_TOO_SMALL (-4)
@@ -164,8 +164,9 @@ int timelite_batches_append(struct timelite_batches *db,
  * Retained batches preserve sequence/value/order; deleted sequences are never
  * reused and the append timestamp floor survives complete expiration.
  * Cursor resumes at its next surviving batch; END remains at its sequence.
- * Temporary retained-copy space must fit the existing database cap; otherwise
- * DATABASE_FULL has no effect. Argument/read rejection before writes preserves
+ * Temporary retained-copy space must fit: current logical end plus bytes of
+ * retained segments cannot exceed DATABASE_CAPACITY. Otherwise DATABASE_FULL
+ * has no effect. Argument/read rejection before writes preserves
  * the handle; any failure after writes begin requires close/reopen. Recovery
  * chooses coherent old/new retention and finishes internal relocation/reclaim.
  * An effective call explicitly installs format 010; old libraries reject it.

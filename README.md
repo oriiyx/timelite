@@ -23,7 +23,7 @@ the test runner, never by the library), then run:
 make check
 ```
 
-This builds build/libtimelite.a, build/basic and build/batches with Make, then
+This builds build/libtimelite.a, build/basic, build/batches and build/continuous with Make, then
 runs the native test profile through the runner (see Testing). The basic example prints:
 
 ```text
@@ -186,6 +186,22 @@ gap. An ad hoc command that provides reusable coverage belongs in the inventory
 or runner, not in a chat transcript.
 
 ## Durable sensor batches (v2)
+
+For an application-controlled append/checkpoint/export/retention/reopen loop,
+see [examples/continuous.c](examples/continuous.c). Build it with `make`, then
+run `./build/continuous DATABASE WAL` with two unused paths. The example keeps
+the cutoff and scheduling policy outside the library, checks status, leaves
+pending WAL data intact during retention, and marks the point where a real
+application must durably export and acknowledge readings before deletion.
+
+Its error flow treats `TIMELITE_WAL_FULL` as a request for an explicit
+checkpoint. If that checkpoint returns `TIMELITE_DATABASE_FULL`, the application
+exports old readings, applies its chosen whole-segment cutoff and retries the
+checkpoint. Retention can itself return `TIMELITE_DATABASE_FULL`; the safe
+choices are to stop appending or select a cutoff that expires more segments.
+`TIMELITE_RECOVERY_REQUIRED` means close and reopen, enumerate committed
+sequences and reconcile the uncertain operation before retrying it. There is no
+automatic policy, exactly-once retry or background maintenance.
 
 The complete example below is also [examples/batches.c](examples/batches.c).
 Build it with `make`, then run `./build/batches DATABASE WAL` using two unused
@@ -399,6 +415,16 @@ a cutoff that expires more segments. Complete expiration needs no temporary
 payload space. The WAL limit remains 64 MiB. Copying may require substantial
 I/O; there is no background work or automatic policy.
 
+For capacity planning, let `L` be the current logical main-file end and `R` the
+bytes in segments that the selected cutoff will retain. Retention needs
+`L + R <= TIMELITE_DATABASE_CAPACITY`. `L` is always the 160-byte prefix plus
+`status.installed_bytes`; pending WAL bytes are not copied. Segment boundaries
+are intentionally not exposed, so an application cannot calculate `R` exactly
+from status alone. A conservative schedule starts retention while
+`160 + 2 * status.installed_bytes` still fits, which leaves room even if every
+installed segment survives. Later calls remain safe: choose a more aggressive
+cutoff or attempt retention and handle a no-effect `TIMELITE_DATABASE_FULL`.
+
 NULL/scratch/closed/poisoned errors follow existing conventions. Pre-write errors
 preserve the handle. Any error after writes begin poisons it until close/reopen;
 the operation may already have taken effect. Recovery preserves a coherent old
@@ -468,9 +494,15 @@ Externally cutting the main file to
 exactly its empty size (160 bytes or less) is indistinguishable from a fresh
 database and outside the recovery model, as is external WAL truncation.
 
-What remains unproven: physical power cuts, device firmware behaviour, and
-target hardware. The interruption model, the native tests and the container and
-cross builds are separate evidence; see
+Evidence boundaries are explicit. A local `native`/`sanitize` pass validates the
+host OS, CPU, ABI, compiler and selected filesystem only. CI results are separate;
+when run, the Windows x64 runtime profile executes the native file backend, v1
+lifecycle and fake-backend batch model tests and verifies that batch
+provisioning is rejected with `ENOTSUP`; it is not durable batch operation on
+Windows storage. Windows cross-builds do not execute. Linux x86-64 and x86
+32-bit container profiles are not ARM32 or deployment-device results. No local,
+CI, model or container run proves device firmware behavior or physical
+power-loss safety. See
 [feature 006](docs/feature/006-checkpoint.md) for the exact byte layouts,
 sync order, interruption table and results.
 
@@ -667,11 +699,15 @@ are in [feature 001](docs/feature/001-file-io.md).
   test runner, shared inventory, runner self-tests and the toolchain image.
 - examples/basic.c: a small application that calls the library.
 - examples/batches.c: complete v2 create/append/checkpoint/reopen/seek/window application.
+- examples/continuous.c: application-controlled status, checkpoint, export,
+  retention, recovery and reopen lifecycle.
 - [AGENTS.md](AGENTS.md) and [CLAUDE.md](CLAUDE.md): coding-agent instructions.
 - [docs/feature/000-init.md](docs/feature/000-init.md): bootstrap scope and results.
 - [docs/feature/003-database-lifecycle.md](docs/feature/003-database-lifecycle.md): lifecycle, header, failure analysis and future WAL contract.
 - [docs/feature/005-testing-suite.md](docs/feature/005-testing-suite.md): testing suite design, verification results and gaps.
 - [docs/feature/006-checkpoint.md](docs/feature/006-checkpoint.md): checkpoint layout, protocol, interruption table and results.
+- [docs/feature/011-continuous-operation.md](docs/feature/011-continuous-operation.md):
+  continuous-operation integration, release evidence and results.
 
 - [docs/feature/007-time-range.md](docs/feature/007-time-range.md): time spans, seek, filtered reads and verification.
 
