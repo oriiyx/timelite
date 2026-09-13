@@ -34,6 +34,13 @@ static void reset(int valid)
     opens = creates = reads = writes = syncs = closes = 0;
 }
 
+int timelite_file_lock(struct timelite_file *file)
+{
+    (void)file;
+    assert(0); /* v1 must never acquire a batch owner lock. */
+    return EIO;
+}
+
 int timelite_file_open(struct timelite_file *file, const char *path)
 {
     (void)path;

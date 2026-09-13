@@ -24,6 +24,7 @@ static int operation, fail_operation, fail_after, error_code;
 static size_t transfer_limit;
 static int read_failure, size_failure, close_failure, truncate_failure;
 static int identity_failure, provisioning_failure, provision_error, create_failure, race;
+static int lock_failure;
 static int writes, truncates, provisions, closes;
 static int read_calls, fail_read_at, payload_reads, short_operation;
 static unsigned char scratch[TIMELITE_BATCH_SCRATCH];
@@ -52,6 +53,7 @@ static void acquire(struct timelite_file *file, int index)
 
 static void faults_clear(void)
 {
+    lock_failure = 0;
     operation = fail_operation = fail_after = 0;
     read_calls = fail_read_at = payload_reads = short_operation = 0;
     read_failure = size_failure = close_failure = truncate_failure = 0;
@@ -96,6 +98,13 @@ static void crash(void)
         f->owned = 0;
     }
     faults_clear();
+}
+
+int timelite_file_lock(struct timelite_file *file)
+{
+    assert(index_of(file) == 0 && files[0].owned);
+    assert(!files[1].owned);
+    return lock_failure;
 }
 
 int timelite_file_open(struct timelite_file *file, const char *path)
@@ -277,6 +286,7 @@ int timelite_file_close(struct timelite_file *file)
 {
     assert(!status_checking);
     assert(!aggregate_checking);
+    assert(files[index_of(file)].owned);
     files[index_of(file)].owned = 0;
 #if defined(_WIN32)
     file->handle = NULL;
@@ -1933,8 +1943,43 @@ static void retention_end_and_checkpoint(void)
     input[0].timestamp_us = UINT64_C(1700000000000000);
 }
 
+static void owner_lock_failures(void)
+{
+    struct timelite_batches db;
+    const int errors[] = {EBUSY, EIO};
+    int mode;
+    size_t i;
+    for (mode = 0; mode < 3; mode++)
+    {
+        for (i = 0; i < sizeof(errors) / sizeof(errors[0]); i++)
+        {
+            TEST_CASE("owner lock before file effects", mode * 10 + (int)i);
+            reset();
+            assert(timelite_batches_init(&db) == 0);
+            if (mode == 0)
+            {
+                assert(open_db(&db, TIMELITE_CREATE_NEW) == 0);
+                assert(timelite_batches_close(&db) == 0);
+            }
+            if (mode == 2)
+            {
+                race = 2;
+            }
+            writes = truncates = provisions = closes = read_calls = 0;
+            lock_failure = errors[i];
+            close_failure = 1;
+            assert(open_db(&db, mode == 0 ? TIMELITE_OPEN_EXISTING :
+                           mode == 1 ? TIMELITE_CREATE_NEW : TIMELITE_OPEN_OR_CREATE) == errors[i]);
+            assert(writes == 0 && truncates == 0 && provisions == 0 && read_calls == 0);
+            assert(closes == 1 && !files[0].owned && !files[1].owned);
+            assert(timelite_batches_close(&db) == EBADF);
+        }
+    }
+}
+
 int main(void)
 {
+    owner_lock_failures();
     input[0].series = 17;
     input[0].timestamp_us = UINT64_C(1700000000000000);
     input[0].value = -123;

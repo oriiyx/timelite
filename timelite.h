@@ -142,6 +142,11 @@ int timelite_batches_init(struct timelite_batches *db);
  * are deleted. Rejects v1 without migration. Scratch >= BATCH_SCRATCH required.
  * Complete corruption fails closed; only validated incomplete suffixes are
  * truncated and synced. Failed opens consume resources and preserve first error.
+ * Acquires an exclusive database owner lock before header reads or writes;
+ * another owner (even in this process) returns positive EBUSY. The lock lasts
+ * until close, including poisoned handles; failed close leaves release uncertain.
+ * Advisory only: external code can modify files. Calls still require serialization;
+ * two processes cannot share a pair. Failed opens leave the closed handle reusable.
  * Windows creation returns ENOTSUP before file effects; otherwise-valid existing
  * pairs fail provisioning with ENOTSUP. */
 int timelite_batches_open(struct timelite_batches *db, const char *database_path,

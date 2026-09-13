@@ -790,7 +790,7 @@ int main(void)
     char directory[4096];
 #endif
     char path[4608], wal_path[4608];
-    struct timelite_batches db;
+    struct timelite_batches db, second;
     struct timelite_db legacy;
     struct timelite_file file = TIMELITE_FILE_INIT;
     struct timelite_record input[2] = {{0, UINT64_MAX, INT64_MIN},
@@ -827,6 +827,30 @@ int main(void)
     assert(error == ENOTSUP);
 #endif
     assert(error == 0);
+    {
+        unsigned char before[2][512], after[512];
+        size_t lengths[2], got;
+        const char *paths[2] = {path, wal_path};
+        int i;
+        TEST_CASE("second batch owner", 0);
+        assert(timelite_batches_init(&second) == 0);
+        for (i = 0; i < 2; i++)
+        {
+            assert(timelite_file_open(&file, paths[i]) == 0);
+            assert(timelite_file_read(&file, 0, before[i], sizeof(before[i]), &lengths[i]) == 0);
+            assert(timelite_file_close(&file) == 0);
+        }
+        assert(timelite_batches_open(&second, path, wal_path, TIMELITE_OPEN_EXISTING,
+                                    scratch, sizeof(scratch)) == EBUSY);
+        for (i = 0; i < 2; i++)
+        {
+            assert(timelite_file_open(&file, paths[i]) == 0);
+            assert(timelite_file_size(&file, &size) == 0 && size == lengths[i]);
+            assert(timelite_file_read(&file, 0, after, sizeof(after), &got) == 0);
+            assert(got == lengths[i] && memcmp(after, before[i], got) == 0);
+            assert(timelite_file_close(&file) == 0);
+        }
+    }
     assert(timelite_batches_next(&db, output, 2, &count, &sequence,
                                 scratch, sizeof(scratch)) == TIMELITE_END);
     assert(count == 99 && sequence == 99);
@@ -850,6 +874,9 @@ int main(void)
                                 scratch, sizeof(scratch)) == 0 && sequence == 2);
     assert(timelite_batches_rewind(&db) == 0);
     assert(timelite_batches_close(&db) == 0);
+    assert(timelite_batches_open(&second, path, wal_path, TIMELITE_OPEN_EXISTING,
+                                scratch, sizeof(scratch)) == 0);
+    assert(timelite_batches_close(&second) == 0);
     assert(timelite_batches_open(&db, path, wal_path, TIMELITE_OPEN_EXISTING,
                                 scratch, sizeof(scratch)) == 0);
     assert(timelite_batches_next(&db, output, 2, &count, &sequence,

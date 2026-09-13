@@ -5,6 +5,7 @@
 #define _POSIX_C_SOURCE 200809L
 #define _DARWIN_C_SOURCE
 #include "file_io.h"
+#include "test_assert.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -16,6 +17,7 @@
 #else
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include "posix_test_paths.h"
 #define IS_CLOSED(file) ((file).fd == -1)
@@ -70,6 +72,57 @@ int main(void)
     CHECK(IS_CLOSED(file));
     CHECK(timelite_file_create(&file, path) == 0);
     created = 1;
+    TEST_CASE("owner lock", 0);
+    assert(timelite_file_lock(NULL) == EINVAL);
+    assert(timelite_file_lock(&other) == EBADF);
+    assert(timelite_file_lock(&file) == 0);
+    assert(timelite_file_open(&other, path) == 0);
+    assert(timelite_file_lock(&other) == EBUSY);
+    assert(timelite_file_close(&other) == 0);
+    {
+        char unrelated[4608];
+        assert(snprintf(unrelated, sizeof(unrelated), "%s/unrelated", directory) < (int)sizeof(unrelated));
+        assert(timelite_file_create(&other, unrelated) == 0);
+        assert(timelite_file_lock(&other) == 0);
+        assert(timelite_file_close(&other) == 0);
+        assert(remove_test_file(unrelated) == 0);
+    }
+#if !defined(_WIN32)
+    {
+        int ready[2], release[2], child_status;
+        char signal;
+        pid_t child;
+        assert(pipe(ready) == 0 && pipe(release) == 0);
+        child = fork();
+        assert(child >= 0);
+        if (child == 0)
+        {
+            /* Drop the inherited description before testing a separate open. */
+            assert(close(ready[0]) == 0 && close(release[1]) == 0);
+            assert(timelite_file_close(&file) == 0);
+            assert(timelite_file_open(&other, path) == 0);
+            assert(timelite_file_lock(&other) == EBUSY);
+            assert(write(ready[1], "x", 1) == 1);
+            assert(read(release[0], &signal, 1) == 1);
+            assert(timelite_file_lock(&other) == 0);
+            assert(timelite_file_close(&other) == 0);
+            _exit(0);
+        }
+        assert(close(ready[1]) == 0 && close(release[0]) == 0);
+        assert(read(ready[0], &signal, 1) == 1);
+        assert(timelite_file_close(&file) == 0);
+        assert(write(release[1], "x", 1) == 1);
+        assert(close(ready[0]) == 0 && close(release[1]) == 0);
+        assert(waitpid(child, &child_status, 0) == child);
+        assert(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
+    }
+#else
+    assert(timelite_file_close(&file) == 0);
+#endif
+    assert(timelite_file_open(&file, path) == 0);
+    assert(timelite_file_lock(&file) == 0);
+    assert(timelite_file_close(&file) == 0);
+    assert(timelite_file_open(&file, path) == 0);
 #if defined(_WIN32)
     {
         DWORD flags;

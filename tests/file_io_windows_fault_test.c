@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#include "test_assert.h"
 
 #define CHECK(condition) do { if (!(condition)) { \
     fprintf(stderr, "line %d: %s\n", __LINE__, #condition); exit(1); \
@@ -157,6 +158,17 @@ BOOL test_sync(HANDLE handle)
     return result_for('y') >= 0;
 }
 
+BOOL test_lock(HANDLE handle, DWORD flags, DWORD reserved, DWORD low,
+               DWORD high, LPOVERLAPPED range)
+{
+    CHECK(handle == TEST_HANDLE);
+    CHECK(flags == (LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY));
+    CHECK(reserved == 0 && low == MAXDWORD && high == MAXDWORD);
+    CHECK(range != NULL && range->Offset == 0 && range->OffsetHigh == 0);
+    CHECK(range->hEvent == NULL && range->Internal == 0 && range->InternalHigh == 0);
+    return result_for('l') >= 0;
+}
+
 BOOL test_close(HANDLE handle)
 {
     CHECK(handle == TEST_HANDLE);
@@ -227,6 +239,18 @@ int main(void)
 #define SCRIPT(name) script(name, sizeof(name) / sizeof(name[0]))
     SCRIPT(open_ok);
     CHECK(timelite_file_open(&file, "test") == 0 && file.handle == TEST_HANDLE);
+    {
+        const DWORD native[] = {0, ERROR_LOCK_VIOLATION, ERROR_ACCESS_DENIED, ERROR_GEN_FAILURE};
+        const int mapped[] = {0, EBUSY, EACCES, EIO};
+        for (index = 0; index < sizeof(native) / sizeof(native[0]); index++)
+        {
+            struct step lock = {'l', native[index] ? -1 : 0, native[index]};
+            TEST_CASE("owner lock fault", index);
+            script(&lock, 1);
+            assert(timelite_file_lock(&file) == mapped[index]);
+            assert(file.handle == TEST_HANDLE);
+        }
+    }
     expected_offset = 10;
     SCRIPT(read_short);
     CHECK(timelite_file_read(&file, 10, bytes, 5, &count) == 0 && count == 5);

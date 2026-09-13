@@ -8,6 +8,7 @@
 #if defined(_WIN32)
 #define _CRT_SECURE_NO_WARNINGS
 #endif
+#define timelite_file_lock real_file_lock
 #define timelite_file_open real_file_open
 #define timelite_file_create real_file_create
 #define timelite_file_read real_file_read
@@ -23,6 +24,7 @@
 #else
 #include "file_io.c"
 #endif
+#undef timelite_file_lock
 #undef timelite_file_open
 #undef timelite_file_create
 #undef timelite_file_read
@@ -54,6 +56,11 @@
 /* Operation counter over the library's write, sync and truncate calls.
  * fail_at = N fails before the Nth operation with EIO; 0 never fails. */
 static int operation, fail_at;
+
+int timelite_file_lock(struct timelite_file *file)
+{
+    return real_file_lock(file);
+}
 
 int timelite_file_open(struct timelite_file *file, const char *path);
 int timelite_file_create(struct timelite_file *file, const char *path);
@@ -528,6 +535,22 @@ int main(void)
     TEST_CASE("pending wal", 0);
     assert(open_pair(path2, wal2_path, TIMELITE_OPEN_EXISTING) == 0);
     append(7, 10, 100);
+    TEST_CASE("inspect held pair, including poisoned owner", 0);
+    {
+        struct timelite_record record = {7, 11, 101};
+        uint64_t sequence;
+        fail_at = operation + 1;
+        assert(timelite_batches_append(&db, &record, 1, scratch, sizeof(scratch),
+                                      &sequence) == EIO);
+        fail_at = 0;
+    }
+    db_length = read_file(path2, saved_db);
+    wal_length = read_file(wal2_path, saved_wal);
+    assert(status(path2, wal2_path, 0) == 2);
+    EXPECT("open_error=EBUSY");
+    assert(verify(path2, wal2_path) == 0);
+    assert(read_file(path2, image) == db_length && memcmp(image, saved_db, db_length) == 0);
+    assert(read_file(wal2_path, image) == wal_length && memcmp(image, saved_wal, wal_length) == 0);
     assert(timelite_batches_close(&db) == 0);
     assert(agree(path2, wal2_path, 0) == 0);
     EXPECT("wal_frames=1");

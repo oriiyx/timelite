@@ -168,6 +168,7 @@ static const char *inspect_error_name(int error)
         case ENOTSUP: return "ENOTSUP";
         case EBADF: return "EBADF";
         case EACCES: return "EACCES";
+        case EBUSY: return "EBUSY";
         case EEXIST: return "EEXIST";
         case EIO: return "EIO";
         case ENOSPC: return "ENOSPC";

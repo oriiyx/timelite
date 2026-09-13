@@ -15,6 +15,9 @@ BOOL test_size(HANDLE handle, PLARGE_INTEGER size);
 BOOL test_truncate(HANDLE handle);
 BOOL test_sync(HANDLE handle);
 BOOL test_close(HANDLE handle);
+BOOL test_lock(HANDLE handle, DWORD flags, DWORD reserved, DWORD low,
+               DWORD high, LPOVERLAPPED range);
+#define LockFileEx test_lock
 #define CreateFileW test_create_file
 #define GetFileType test_file_type
 #define GetFileInformationByHandle test_file_info

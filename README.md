@@ -316,9 +316,23 @@ Caller owns the handle, records and scratch. Batch operations with scratch argum
 `TIMELITE_BATCH_SCRATCH` (1344) scratch bytes. Output capacity is in records;
 64 records always suffice. Public struct size can include platform padding;
 encoded records are exactly 20 bytes. No allocation, retained buffers, global
-mutable production state, threads, or locks. Buffers/outputs and handles must not
+mutable production state or threads. Buffers/outputs and handles must not
 overlap. Calls and filesystem ownership must remain serialized; do not copy an
 open handle or externally modify, rename, replace or delete its files/directories.
+
+Batch open takes an exclusive nonblocking kernel owner lock on the database
+before reading its header or writing either file. A second owner, including a
+second handle in the same process, returns positive `EBUSY`. The lock lasts
+until close, including while the handle is poisoned; failed close leaves native
+resource and lock release uncertain. This is advisory: a process bypassing the
+library can still modify the files. It is not a multi-process access feature;
+two processes cannot share a pair. Calls by the owner must still be serialized.
+Only the database is locked: the WAL is reached through pair open, so a second
+lock adds nothing under the stable trusted-path contract. v1 is unchanged.
+POSIX uses `flock`; network filesystems such as NFS/SMB and unusual mounts may
+have unreliable or different lock semantics and are outside the supported local
+provisioning contract. No weaker fallback is used. See
+[feature 013](docs/feature/013-owner-lock.md).
 
 The WAL limit is 64 MiB including its 32-byte header. A batch occupies
 64 + 20 × record count bytes (84..1344). `TIMELITE_WAL_FULL` rejects a batch
@@ -603,6 +617,8 @@ modes, and the difference matters:
   stdio, never opens them through the library, and never writes, truncates,
   syncs or creates anything. It reports what is on disk and states what the
   library's recovery would do, without doing it.
+  On a pair held open by another process, `verify` reads a moving target and
+  may report a transient incomplete suffix; it takes no lock.
 - `status DATABASE WAL` **recovers**. It opens the pair with the public API
   (`TIMELITE_OPEN_EXISTING`), which performs the normal recovery: an
   incomplete WAL suffix is truncated, an interrupted reclaim or retention is
@@ -681,6 +697,9 @@ installed_bytes=148
 last_timestamp_us=1700000000000000
 batch=1 series=7 us=1700000000000000 value=23500
 ```
+
+`status` refuses a pair another owner holds open with `open_error=EBUSY`
+and exit 2, before recovery or header reads. `verify` remains lock-free.
 
 When `recovery.result` is not `ok`, `verify` names the library error the open
 would return (for example `TIMELITE_INVALID_DATABASE` for a damaged committed
@@ -775,7 +794,8 @@ platform differences are in [feature 002](docs/feature/002-windows-file-io.md).
 Linux is the provisional deployment OS and macOS the local development OS.
 Linux uses 64-bit file offsets, including in 32-bit builds. Exact x86/ARM32 CPU,
 OS, and ABI still require confirmation. One owner must serialize calls; this
-layer provides no process locking or protection from concurrent file changes.
+layer offers an explicit owner lock for batch open, but no protection from
+external code that bypasses the contract.
 
 Explicit sync uses Linux `fdatasync` or macOS `F_FULLFSYNC`, reporting failures
 without a weaker fallback. Windows uses `FlushFileBuffers` to request flushing

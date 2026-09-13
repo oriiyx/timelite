@@ -30,7 +30,7 @@ struct timelite_file
  * open/create do not replace the original error. No path is removed here.
  * POSIX: files are opened read/write, close-on-exec; create uses 0600 with umask.
  * Open follows symlinks; create refuses any existing path. Use trusted paths.
- * Only regular files are accepted. No locks or multi-process protection.
+ * Only regular files are accepted. Open/create do not implicitly lock.
  * Failed read/write/size/truncate/sync retain ownership of the handle; a failed
  * transfer or truncate may change data or position. Close it when finished. */
 /* Windows: UTF-8 paths, at most 259 bytes excluding NUL, checked conversion to
@@ -41,6 +41,15 @@ struct timelite_file
  * other handles can still deny sharing. No general multi-process protection. */
 int timelite_file_open(struct timelite_file *file, const char *path);
 int timelite_file_create(struct timelite_file *file, const char *path);
+
+/* Exclusive nonblocking owner lock; returns 0, EBUSY for contention, or errno.
+ * Requires an open handle; failure retains ownership. No retry, even for EINTR.
+ * POSIX flock is per open file description. Windows LockFileEx locks the whole
+ * range; only this operation maps ERROR_LOCK_VIOLATION to EBUSY (other operations
+ * retain feature 002's EACCES mapping). Close releases the lock; failed close
+ * leaves release uncertain. Advisory contract: external code can modify files.
+ * Link exactly one native backend. No explicit unlock operation. */
+int timelite_file_lock(struct timelite_file *file);
 
 /* transferred is required and set to zero before validation. A zero length
  * permits a NULL buffer. Offset + length must fit INT64_MAX, even for reads.

@@ -21,6 +21,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <unistd.h>
 
 /* A bad toolchain configuration must fail rather than silently limit offsets. */
@@ -90,6 +91,21 @@ int timelite_file_open(struct timelite_file *file, const char *path)
 int timelite_file_create(struct timelite_file *file, const char *path)
 {
     return open_file(file, path, O_CREAT | O_EXCL);
+}
+
+int timelite_file_lock(struct timelite_file *file)
+{
+    int error = check_file(file);
+    if (error != 0)
+    {
+        return error;
+    }
+    if (flock(file->fd, LOCK_EX | LOCK_NB) != 0)
+    {
+        error = errno;
+        return error == EWOULDBLOCK ? EBUSY : error;
+    }
+    return 0;
 }
 
 static int check_transfer(struct timelite_file *file, uint64_t offset,

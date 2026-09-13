@@ -40,3 +40,5 @@ provisioning is unsupported and must return ENOTSUP without a weaker fallback.
 Use AGENTS.md, feature 004, feature 006, feature 007 and feature 010 for the qualified durability, memory,
 ownership and checkpoint contracts. Never treat an in-place overwrite as atomic. Link exactly one native backend. Report physical-device, Windows
 runtime, CI, cross-build and simulated-interruption results separately.
+
+Feature 013 enforces batch ownership with a nonblocking database kernel lock (EBUSY until close); v1 and lock-free inspect verify remain unchanged.

@@ -133,3 +133,5 @@ Use simple, explicit C99 in the style requested by the user:
   Reports are uploaded even on failure. Report local results separately from
   CI and device results. Never claim unrun checks passed.
 - Do not add database features as part of unrelated setup or documentation work.
+
+Feature 013 enforces batch ownership with a nonblocking database kernel lock (EBUSY until close); v1 and lock-free inspect verify remain unchanged.

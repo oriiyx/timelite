@@ -145,6 +145,23 @@ int timelite_file_create(struct timelite_file *file, const char *path)
     return open_file(file, path, CREATE_NEW);
 }
 
+int timelite_file_lock(struct timelite_file *file)
+{
+    int error = check_file(file);
+    if (error != 0)
+    {
+        return error;
+    }
+    OVERLAPPED range = {0};
+    if (!LockFileEx(file->handle, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                    0, MAXDWORD, MAXDWORD, &range))
+    {
+        DWORD native_error = GetLastError();
+        return native_error == ERROR_LOCK_VIOLATION ? EBUSY : windows_error(native_error);
+    }
+    return 0;
+}
+
 static int check_transfer(struct timelite_file *file, uint64_t offset,
                           const void *buffer, size_t length, size_t *transferred)
 {

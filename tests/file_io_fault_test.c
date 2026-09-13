@@ -10,6 +10,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/file.h>
+#include "test_assert.h"
 #include <unistd.h>
 
 #define CHECK(condition) do { if (!(condition)) { \
@@ -120,6 +122,12 @@ int test_sync(int fd, ...)
     return result_for('y');
 }
 
+int test_flock(int fd, int operation)
+{
+    CHECK(fd == 42 && operation == (LOCK_EX | LOCK_NB));
+    return result_for('l');
+}
+
 int test_close(int fd)
 {
     CHECK(fd == 42);
@@ -156,6 +164,18 @@ int main(void)
 #define SCRIPT(name) script(name, sizeof(name) / sizeof(name[0]))
     SCRIPT(open_retry);
     CHECK(timelite_file_open(&file, "test") == 0 && file.fd == 42);
+    {
+        const int errors[] = {0, EWOULDBLOCK, EINTR, EIO};
+        size_t i;
+        for (i = 0; i < sizeof(errors) / sizeof(errors[0]); i++)
+        {
+            struct step lock = {'l', errors[i] ? -1 : 0, errors[i]};
+            TEST_CASE("owner lock fault", i);
+            script(&lock, 1);
+            assert(timelite_file_lock(&file) == (errors[i] == EWOULDBLOCK ? EBUSY : errors[i]));
+            assert(file.fd == 42);
+        }
+    }
     SCRIPT(read_retry);
     CHECK(timelite_file_read(&file, 10, bytes, 5, &count) == 0 && count == 5);
     SCRIPT(write_retry);

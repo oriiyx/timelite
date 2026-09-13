@@ -6,6 +6,8 @@ ssize_t test_pwrite(int fd, const void *buffer, size_t count, off_t offset);
 int test_ftruncate(int fd, off_t size);
 int test_sync(int fd, ...);
 int test_close(int fd);
+int test_flock(int fd, int operation);
+#define flock test_flock
 #define open test_open
 #define fstat test_fstat
 #define pread test_pread

@@ -1144,7 +1144,11 @@ int timelite_batches_open(struct timelite_batches *db, const char *database_path
         }
         else if (error == 0)
         {
-            error = timelite_file_create(&wal, wal_path);
+            error = timelite_file_lock(&database);
+            if (error == 0)
+            {
+                error = timelite_file_create(&wal, wal_path);
+            }
             if (error == 0)
             {
                 error = create_header(&database, "TIMELITE", identity, 1);
@@ -1161,6 +1165,11 @@ int timelite_batches_open(struct timelite_batches *db, const char *database_path
     }
     if (!create)
     {
+        error = timelite_file_lock(&database);
+        if (error != 0)
+        {
+            goto fail;
+        }
         /* Validate DB before touching its companion (including v1 rejection). */
         error = pair_header(&database, header, "TIMELITE");
         if (error != 0)
