@@ -61,6 +61,8 @@ PROFILES = {
                           cc=['x86_64-w64-mingw32-gcc'], ar=['x86_64-w64-mingw32-ar'],
                           target='windows/x86_64', execute=False,
                           summary='MinGW-w64 cross-compilation only; nothing is executed'),
+    'arm32-cross': dict(kind='cross', platform='posix', flags=[], storage='required',
+                        execute=False, summary='explicit confirmed ARM32 SDK; compilation only'),
     'windows-native': dict(kind='native', platform='windows', storage='contract',
                            flags=['--target=x86_64-pc-windows-msvc'],
                            cc=['clang'], ar=['llvm-ar'],
@@ -246,6 +248,26 @@ def configuration(name):
     LDFLAGS/LDLIBS override host profiles; container toolchains are fixed."""
     profile = PROFILES[name]
     windows = profile['platform'] == 'windows'
+    if name == 'arm32-cross':
+        path = os.environ.get('TIMELITE_ARM32_CONFIG')
+        if not path:
+            return dict(profile=name, blocked='set TIMELITE_ARM32_CONFIG to the confirmed target JSON')
+        try:
+            target = json.loads(Path(path).read_text(encoding='utf-8'))
+            for key in ('device', 'isa', 'os', 'kernel', 'abi', 'libc', 'sdk_identity', 'triple', 'float_abi'):
+                if not isinstance(target.get(key), str) or not target[key].strip():
+                    raise ValueError('missing target field: ' + key)
+            for key in ('cc', 'ar', 'flags', 'link', 'libs'):
+                if not isinstance(target.get(key), list) or not all(isinstance(x, str) for x in target[key]):
+                    raise ValueError(key + ' must be an argument array')
+            if not target['cc'] or not target['ar'] or target['float_abi'] not in ('hard', 'soft'):
+                raise ValueError('compiler, archiver and hard/soft calling convention required')
+        except (OSError, ValueError) as error:
+            return dict(profile=name, blocked=str(error))
+        return dict(profile=name, cc=target['cc'], ar=target['ar'],
+                    flags=['-I.'] + target['flags'] + STRICT + ['-UNDEBUG', '-D_FILE_OFFSET_BITS=64'],
+                    link=target['link'], libs=target['libs'], target=target,
+                    platform='posix', backend='file_io.c', exe='', execute=False, storage='required')
     if profile['kind'] == 'container':
         cc, ar = list(profile['cc']), list(profile['ar'])
     else:
@@ -277,6 +299,8 @@ def native(name, source, out, selected, jobs, timeout, test_root, commands):
         inventory = [t for t in inventory if t['name'] == selected]
         if not inventory:
             return [row('selection', 'FAIL', 'no inventory test named ' + repr(selected))], meta
+    if config.get('blocked'):
+        return [row(t['name'], 'BLOCKED', config['blocked']) for t in inventory], meta
     if config['execute'] and not host_matches(config):
         return [row(t['name'], 'BLOCKED', 'profile needs a %s host' % config['platform'])
                 for t in inventory], meta
@@ -298,6 +322,27 @@ def native(name, source, out, selected, jobs, timeout, test_root, commands):
     if version['status'] != 'PASS':
         return rows + [row(t['name'], 'BLOCKED', 'compiler unavailable: ' + ' '.join(config['cc']),
                            coverage=t['coverage'], commands=[version]) for t in applicable], meta
+
+    if name == 'arm32-cross':
+        definitions = dict(line.split(maxsplit=2)[1:] for line in log_output(macros).splitlines()
+                           if line.startswith('#define ') and len(line.split(maxsplit=2)) == 3)
+        hard = '__ARM_PCS_VFP' in definitions
+        target = config['target']
+        if (machine['status'] != 'PASS' or macros['status'] != 'PASS' or
+                '__arm__' not in definitions or '__linux__' not in definitions or
+                definitions.get('__SIZEOF_POINTER__') != '4' or
+                log_output(machine).strip() != target['triple'] or
+                hard != (target['float_abi'] == 'hard')):
+            return rows + [row(t['name'], 'BLOCKED', 'compiler macros/triple do not match ARM32 Linux target',
+                               commands=[machine, macros]) for t in applicable], meta
+        abi_source = out / 'offset-check.c'
+        abi_source.write_text('#include <sys/types.h>\ntypedef char offset_must_be_64[(sizeof(off_t) == 8) ? 1 : -1];\nint main(void) { return 0; }\n')
+        abi_check = call(config['cc'] + config['flags'] + config['link'] + [abi_source] +
+                         config['libs'] + ['-o', out / 'offset-check'], 'offset-check')
+        meta['offset_check'] = abi_check
+        if abi_check['status'] != 'PASS':
+            return rows + [row(t['name'], 'BLOCKED', '64-bit off_t compile/link check failed',
+                               commands=[abi_check]) for t in applicable], meta
 
     # Shared prerequisite: the public static library, built once per configuration.
     prerequisites = []
@@ -387,8 +432,9 @@ def native(name, source, out, selected, jobs, timeout, test_root, commands):
         if binary is None:
             return r
         execution = t.get('execution')
-        if not config['execute']:
-            r.update(status='PASS', reason='compiled only; not executed in this profile', coverage='cross-build')
+        if not config['execute'] or execution == 'compile-only':
+            r.update(status='PASS', reason='compiled only; not executed in this profile',
+                     coverage='cross-build' if not config['execute'] else 'standalone tool compilation')
             return r
         if execution == 'batch-example' and capability != 'supported':
             r.update(**unsupported_status(config, 'batch example needs supported durable provisioning'))
@@ -647,9 +693,13 @@ def action_prepare(commands):
     return 0 if data['status'] == 'PASS' else 1
 
 
-def selftest(source, out, timeout, commands):
-    result = commands.run([sys.executable, '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_runner.py'],
-                          source, Path(out) / 'unittest.log', timeout)
+def selftest(source, out, timeout, commands, test_root=None):
+    env = os.environ.copy()
+    if test_root:
+        env.update(TMPDIR=str(Path(test_root).resolve()), TMP=str(Path(test_root).resolve()),
+                   TEMP=str(Path(test_root).resolve()))
+    result = commands.run([sys.executable, '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_*.py'],
+                          source, Path(out) / 'unittest.log', timeout, env)
     return [row('unittest', result['status'], result['reason'], coverage='runner behavior unit tests',
                 commands=[result])], {}
 
@@ -679,7 +729,7 @@ def action_run(args, commands):
             if args.test:
                 rows, meta = [row('selection', 'FAIL', '--test selects C inventory tests; the runner profile has none')], {}
             else:
-                rows, meta = selftest(source, profile_out, args.timeout, commands)
+                rows, meta = selftest(source, profile_out, args.timeout, commands, args.test_root)
         elif kind == 'container' and not args.worker:
             rows, meta = container(name, source, profile_out, args.test, args.jobs, args.timeout,
                                    args.test_root, commands)

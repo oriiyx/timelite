@@ -119,6 +119,23 @@ Dockerfile hash, so editing it requires another `prepare`. Prepared runs use
 directory (plus a private child of `--test-root` when given). No privileged
 containers or host devices are used.
 
+### Target-device evidence (feature 014)
+
+Hardware execution is deferred. `arm32-cross` is an opt-in, compile-only profile
+using an explicitly configured, confirmed target SDK; it is outside local and
+preflight. No default ARM ABI or device compatibility is assumed.
+
+```sh
+TIMELITE_ARM32_CONFIG=/absolute/confirmed-target.json python3 tools/test.py run arm32-cross
+```
+
+See [the target evidence procedure](tools/target/README.md) for SDK preparation,
+configuration fields, device baseline with `--test-root`, the bounded workload,
+independent controller acknowledgement journal, preservation before inspection,
+recovery oracle, continuation checks and controlled physical-cut trial ledger.
+No power-control action is automated or authorized by running these tools.
+See [feature 014](docs/feature/014-target-evidence.md) for actual results and gaps.
+
 ### Results
 
 Statuses are PASS, FAIL, SKIP, BLOCKED and NOT RUN, each with a reason. A run

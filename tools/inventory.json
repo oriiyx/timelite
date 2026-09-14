@@ -1,4 +1,9 @@
 [
+  {"name": "target_workload", "source": "tools/target/workload.c", "backend": "library",
+   "platforms": ["posix", "windows"], "coverage": "bounded target workload build and usage smoke"},
+  {"name": "timelite-inspect", "source": "tools/inspect/inspect.c", "backend": "library",
+   "platforms": ["posix", "windows"], "execution": "compile-only",
+   "coverage": "standalone inspection executable compilation"},
   {"name": "basic", "source": "examples/basic.c", "backend": "library",
    "platforms": ["posix", "windows"], "coverage": "public static-library consumer",
    "stdout": "Timelite 0.1.0-dev\n"},
