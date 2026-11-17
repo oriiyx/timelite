@@ -135,3 +135,12 @@ Use simple, explicit C99 in the style requested by the user:
 - Do not add database features as part of unrelated setup or documentation work.
 
 Feature 013 enforces batch ownership with a nonblocking database kernel lock (EBUSY until close); v1 and lock-free inspect verify remain unchanged.
+
+Feature 015 adds per-record int64/binary64 values through typed append/read and
+aggregation APIs. New pairs use v3 headers; v2 pairs remain integer-writable
+and readable without migration. Integer APIs remain source-compatible after
+rebuilding; TIMELITE_BATCH_SCRATCH is 1600. Finite binary64 only, exact signed
+zero/subnormal preservation, explicit representation checks and ENOTSUP on
+unsupported float operations. Mixed extrema use exact comparisons and retain
+input types; integer readers reject selected floats without conversion.
+Inspect understands both encodings and prints explicit types and float bits.

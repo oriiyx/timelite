@@ -23,7 +23,7 @@ the test runner, never by the library), then run:
 make check
 ```
 
-This builds build/libtimelite.a, build/basic, build/batches, build/continuous
+This builds build/libtimelite.a, build/basic, build/batches, build/continuous, build/typed
 and build/timelite-inspect with Make, then
 runs the native test profile through the runner (see Testing). The basic example prints:
 
@@ -203,7 +203,7 @@ changed, stop. Rerun only after a change, a failure or for a concrete coverage
 gap. An ad hoc command that provides reusable coverage belongs in the inventory
 or runner, not in a chat transcript.
 
-## Durable sensor batches (v2)
+## Durable sensor batches (v3, with v2 reading)
 
 For an application-controlled append/checkpoint/export/retention/reopen loop,
 see [examples/continuous.c](examples/continuous.c). Build it with `make`, then
@@ -320,7 +320,7 @@ int main(int argc, char **argv)
 
 Each reading has a 32-bit series identifier, unsigned 64-bit microseconds since
 the Unix epoch, and signed 64-bit integer value. The application chooses units
-(e.g. thousandths of a degree); no floating-point representation is assumed.
+(e.g. thousandths of a degree); the integer API makes no floating-point representation assumption. Typed values are described below.
 All field values are valid, including series zero. Timestamps must be non-decreasing within each batch and across all committed
 batches, globally across series. Equal timestamps are accepted and preserved.
 A decrease returns `TIMELITE_OUT_OF_ORDER` (-9) before any I/O, with no effect
@@ -330,9 +330,9 @@ their original order; they are not retroactively sorted.
 Empty batches and more than 64 readings return `EINVAL` before writes.
 
 Caller owns the handle, records and scratch. Batch operations with scratch arguments take at least
-`TIMELITE_BATCH_SCRATCH` (1344) scratch bytes. Output capacity is in records;
+`TIMELITE_BATCH_SCRATCH` (1600) scratch bytes. Output capacity is in records;
 64 records always suffice. Public struct size can include platform padding;
-encoded records are exactly 20 bytes. No allocation, retained buffers, global
+encoded integer records are 20 bytes and typed records are 24 bytes. No allocation, retained buffers, global
 mutable production state or threads. Buffers/outputs and handles must not
 overlap. Calls and filesystem ownership must remain serialized; do not copy an
 open handle or externally modify, rename, replace or delete its files/directories.
@@ -356,6 +356,55 @@ The WAL limit is 64 MiB including its 32-byte header. A batch occupies
 before writes; committed WAL data is never overwritten and is reclaimed only by
 checkpoint. There is no rotation, general compaction or per-series index. Explicit
 whole-segment retention is described below.
+
+### Typed integer and floating-point readings
+
+New pairs accept both exact `int64_t` and finite IEEE 754 binary64 (`double`)
+values, typed **per record**, including mixed batches. Existing integer callers
+keep their structs and functions. Rebuild with the new header: the scratch
+constant is now 1600 bytes, and hardcoded 1344-byte buffers must grow.
+
+```c
+struct timelite_typed_record readings[] = {
+    {7, 100, {TIMELITE_VALUE_INT64, {.integer = INT64_C(9007199254740993)}}},
+    {8, 100, {TIMELITE_VALUE_FLOAT64, {.floating = -0.125}}}
+};
+/* db is open; scratch has TIMELITE_BATCH_SCRATCH bytes. */
+error = timelite_batches_append_typed(&db, readings, 2,
+                                      scratch, sizeof(scratch), &sequence);
+```
+
+Use `timelite_batches_next_typed`, `timelite_batches_next_range_typed` and
+`timelite_batches_aggregate_range_typed` with the typed record/result structs.
+Seek, rewind, checkpoint, retention and ownership work as before. The complete
+[typed example](examples/typed.c) builds as `build/typed`; run it with two unused
+paths. It prints `count=2 min=float64:-0.125 max=int64:9007199254740993`.
+
+NaN and infinities return `EINVAL` before append effects. Finite values preserve
+their exact binary64 bits, including subnormals and negative zero, across reopen,
+checkpoint and retention. `timelite_float64_supported()` checks numeric limits,
+size and native bit representation. Unsupported representations return `ENOTSUP`
+when appending or returning floats; integer operations and recovery/copying stay
+available. Build without fast-math or transformations that discard signed zero;
+`TIMELITE_DISABLE_FLOAT64` explicitly disables floating support. No blanket C99,
+ARM32 or device compatibility is assumed.
+
+Typed aggregation counts all selected records and returns extrema with their
+original type and bits. Mixed comparisons are exact even beyond double's exact
+integer range; integers are never converted to doubles. Numerical ties retain
+the first input, including int zero and either floating zero. Empty results have
+count zero and integer-zero extrema. The original integer readers/aggregation
+return `TIMELITE_VALUE_TYPE_MISMATCH` for selected floats without changing outputs
+or cursor. Filtered-out floats do not cause this error. Combine series only when
+their units are comparable.
+
+Integer appends retain compact 20-byte records; typed appends use 24-byte tagged
+records (88..1600 bytes per batch). V3 permits both frame forms. Status reports
+`format_version`; inspect dumps explicit types and float payload bits. Existing
+v2 pairs accept integer appends but reject float append with
+`TIMELITE_UNSUPPORTED_VERSION`; there is no migration or rewrite on open.
+See [Feature 015](docs/feature/015-floating-point-values.md) for exact encoding,
+representation checks, memory requirements, compatibility and verification.
 
 ### Time-range aggregation
 
@@ -587,15 +636,17 @@ never retry native close. Cleanup preserves the primary error and deletes nothin
 
 Creation requires both names to be unused. Existing opens require both members;
 open-or-create never repairs a missing member of an existing pair. Partial
-creation may leave empty, partial or complete files. v2 headers associate the pair
+creation may leave empty, partial or complete files. v2/v3 headers associate the pair
 using an OS-random 128-bit identity and integrity checks. Different identities
 return `TIMELITE_PAIR_MISMATCH` before modification. Copy/backup both files only
 while closed; independently writable copies must not be mixed. Random identity
 collision is improbable, not mathematically impossible or tamper protection.
 
 The v1 12-byte format and `timelite_open` API retain their original behavior.
-The v2 API rejects v1 with `TIMELITE_UNSUPPORTED_VERSION`; the v1 API likewise
-rejects v2. Migration is deferred; no automatic upgrade or file deletion occurs.
+The batch API rejects v1 with `TIMELITE_UNSUPPORTED_VERSION`; the v1 API likewise
+rejects v2/v3. New pairs use v3. Existing v2 pairs remain readable and integer-writable;
+opening never upgrades their format. Older v2 binaries reject v3 headers before
+recovery or writes. Migration is deferred; no automatic upgrade or deletion occurs.
 
 Durable success requires a local filesystem supporting the specified flush
 operations: macOS APFS/HFS+ or Linux ext-family/XFS/Btrfs are admitted; other types
@@ -712,7 +763,7 @@ installed_segments=1
 wal_bytes=32
 installed_bytes=148
 last_timestamp_us=1700000000000000
-batch=1 series=7 us=1700000000000000 value=23500
+batch=1 series=7 us=1700000000000000 value=23500 type=int64
 ```
 
 `status` refuses a pair another owner holds open with `open_error=EBUSY`
@@ -777,7 +828,7 @@ success does not promise durable creation under power loss. Reopen proves only
 visibility. See [feature 003](docs/feature/003-database-lifecycle.md) for exact
 validation order, ownership, format evolution and the proposed WAL contract.
 
-The separate v2 batch API above implements WAL append, recovery, checkpointing
+The separate batch API above implements WAL append, recovery, checkpointing
 into main-storage segments and WAL reclamation.
 
 ## Internal file I/O
@@ -819,10 +870,10 @@ without a weaker fallback. Windows uses `FlushFileBuffers` to request flushing
 buffered file information to the device, reporting failure without fallback.
 There is no claim that these OS requests have identical durability semantics.
 Ordinary file create/sync does not sync the parent directory. The separate internal
-`timelite_file_provision` operation used by v2 checks association and syncs the
+`timelite_file_provision` operation used by the batch API checks association and syncs the
 parent directory; ordinary creation alone has no durable directory-entry promise. Close is not
 sync. These legacy file operations alone provide no database commit or recovery guarantee.
-The v2 batch API adds the qualified protocol described above.
+The batch API adds the qualified protocol described above.
 Reopen tests check visibility only. Official sync references and detailed limits
 are in [feature 001](docs/feature/001-file-io.md).
 
@@ -838,7 +889,8 @@ are in [feature 001](docs/feature/001-file-io.md).
 - tools/inspect/inspect.c: the offline inspection tool built as
   build/timelite-inspect (read-only `verify`, recovering `status`).
 - examples/basic.c: a small application that calls the library.
-- examples/batches.c: complete v2 create/append/checkpoint/reopen/seek/window application.
+- examples/batches.c: complete batch create/append/checkpoint/reopen/seek/window application.
+- examples/typed.c: mixed integer/binary64 append, checkpoint and exact aggregation.
 - examples/continuous.c: application-controlled status, checkpoint, export,
   retention, recovery and reopen lifecycle.
 - [AGENTS.md](AGENTS.md) and [CLAUDE.md](CLAUDE.md): coding-agent instructions.

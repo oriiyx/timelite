@@ -637,7 +637,7 @@ static void format_cases(void)
         }
         if (i == 1)
         {
-            wal_bytes[8] = 3;
+            wal_bytes[8] = 4;
             expected = TIMELITE_UNSUPPORTED_VERSION;
         }
         if (i == 2)
@@ -1977,6 +1977,357 @@ static void owner_lock_failures(void)
     }
 }
 
+#include "typed_cases.h"
+
+static void typed_model_fixture(struct timelite_batches *db)
+{
+    struct timelite_typed_record records[64];
+    uint64_t sequence, time;
+    new_db(db);
+    for (time = 10; time <= 40; time += 10)
+    {
+        typed_input(records, time);
+        assert(timelite_batches_append_typed(db, records, 64, scratch, sizeof(scratch), &sequence) == 0);
+        if (time != 40)
+        {
+            assert(checkpoint(db) == 0);
+        }
+    }
+    faults_clear();
+}
+
+static void typed_model_contents(struct timelite_batches *db)
+{
+    uint64_t time;
+    assert(timelite_batches_rewind(db) == 0);
+    if (db->private_live_batches == 3 || db->private_live_batches == 4)
+    {
+        typed_read_check(db, 10, scratch, sizeof(scratch));
+    }
+    for (time = 20; time <= 40; time += 10)
+    {
+        typed_read_check(db, time, scratch, sizeof(scratch));
+    }
+}
+
+static void typed_model_tests(void)
+{
+    struct timelite_batches db;
+    struct timelite_typed_record records[64];
+    uint64_t sequence;
+    int kind, total, boundary, after, survive, result, recovery_total, recovery_boundary;
+    /* Golden vector generated independently with Python struct and zlib. */
+    static const unsigned char golden[] =
+        "\x54\x4c\x42\x41\x54\x43\x48\x21\x01\x00\x00\x00\x00\x00\x00\x00"
+        "\x01\x00\x00\x00\x38\x00\x00\x00\x0f\x00\x00\x00\x80\x93\xd9\xf6"
+        "\x07\x00\x00\x00\x64\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+        "\x00\x00\xf4\xbf\x01\x00\x00\x00\x54\x4c\x43\x4f\x4d\x4d\x49\x54"
+        "\x01\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x38\x00\x00\x00"
+        "\x75\xf8\xa9\x74\xcb\x94\x1a\xb2";
+    new_db(&db);
+    records[0].series = 7;
+    records[0].timestamp_us = 100;
+    records[0].value = typed_float(UINT64_C(0xbff4000000000000));
+    assert(timelite_batches_append_typed(&db, records, 1, scratch, sizeof(scratch), &sequence) == 0);
+    assert(sizeof(golden) - 1 == 88 && memcmp(wal_bytes + 32, golden, 88) == 0);
+    assert(database_bytes[8] == 3 && wal_bytes[8] == 3);
+    assert(timelite_batches_close(&db) == 0);
+    TEST_CASE("typed shared behavior", 0);
+    new_db(&db);
+    typed_cases(&db, scratch, sizeof(scratch));
+    typed_precision(&db, scratch, sizeof(scratch));
+    assert(timelite_batches_close(&db) == 0);
+    /* Every aggregate read failure preserves both output and borrowed cursor. */
+    {
+        struct timelite_typed_aggregate aggregate, saved;
+        struct timelite_batches before;
+        struct timelite_range range = {0, 50, 0, 0};
+        int reads, read_boundary;
+        typed_model_fixture(&db);
+        assert(timelite_batches_aggregate_range_typed(&db, &range, &aggregate, scratch, sizeof(scratch)) == 0);
+        reads = read_calls;
+        before = db;
+        memset(&aggregate, 0x5a, sizeof(aggregate));
+        memcpy(&saved, &aggregate, sizeof(saved));
+        for (read_boundary = 1; read_boundary <= reads; read_boundary++)
+        {
+            TEST_CASE("typed aggregate read failure", read_boundary);
+            faults_clear();
+            fail_read_at = read_boundary;
+            aggregate_checking = 1;
+            result = timelite_batches_aggregate_range_typed(&db, &range, &aggregate, scratch, sizeof(scratch));
+            aggregate_checking = 0;
+            assert(result == EIO);
+            assert(memcmp(&aggregate, &saved, sizeof(saved)) == 0);
+            assert(memcmp(&db, &before, sizeof(db)) == 0);
+        }
+        faults_clear();
+        assert(timelite_batches_close(&db) == 0);
+    }
+    for (kind = 0; kind < 2; kind++)
+    {
+        typed_model_fixture(&db);
+        assert((kind ? expire(&db, 15) : checkpoint(&db)) == 0);
+        total = operation;
+        assert(timelite_batches_close(&db) == 0);
+        for (boundary = 1; boundary <= total + 2; boundary++)
+        {
+            for (after = 0; after <= 1; after++)
+            {
+                for (survive = 0; survive <= 1; survive++)
+                {
+                    TEST_CASE(kind ? "typed retention faults" : "typed checkpoint faults", boundary * 100 + after * 10 + survive);
+                    typed_model_fixture(&db);
+                    if (boundary <= total)
+                    {
+                        fail_operation = boundary;
+                        fail_after = after;
+                    }
+                    else
+                    {
+                        truncate_failure = boundary - total;
+                    }
+                    assert((kind ? expire(&db, 15) : checkpoint(&db)) == EIO);
+                    if (survive)
+                    {
+                        persist(0);
+                        persist(1);
+                    }
+                    crash();
+                    assert(timelite_batches_init(&db) == 0);
+                    assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
+                    recovery_total = operation;
+                    typed_model_contents(&db);
+                    assert(timelite_batches_close(&db) == 0);
+                    /* Interrupt each recovery write/sync, with its bytes both
+                     * surviving and disappearing at the next simulated crash. */
+                    for (recovery_boundary = 1; recovery_boundary <= (recovery_total == 0 ? 0 : recovery_total + 2); recovery_boundary++)
+                    {
+                        TEST_CASE("typed interrupted recovery", kind * 10000 + boundary * 100 + recovery_boundary);
+                        typed_model_fixture(&db);
+                        if (boundary <= total)
+                        {
+                            fail_operation = boundary;
+                            fail_after = after;
+                        }
+                        else
+                        {
+                            truncate_failure = boundary - total;
+                        }
+                        assert((kind ? expire(&db, 15) : checkpoint(&db)) == EIO);
+                        if (survive)
+                        {
+                            persist(0);
+                            persist(1);
+                        }
+                        crash();
+                        assert(timelite_batches_init(&db) == 0);
+                        if (recovery_boundary <= recovery_total)
+                        {
+                            fail_operation = recovery_boundary;
+                            fail_after = after;
+                        }
+                        else
+                        {
+                            truncate_failure = recovery_boundary - recovery_total;
+                        }
+                        assert(open_db(&db, TIMELITE_OPEN_EXISTING) == EIO);
+                        assert(!files[0].owned && !files[1].owned);
+                        if (survive)
+                        {
+                            persist(0);
+                            persist(1);
+                        }
+                        crash();
+                        assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
+                        typed_model_contents(&db);
+                        assert(timelite_batches_close(&db) == 0);
+                    }
+                }
+            }
+        }
+    }
+    for (boundary = 1; boundary <= 4; boundary++)
+    {
+        for (after = 0; after <= 1; after++)
+        {
+            for (survive = 0; survive <= 1; survive++)
+            {
+                TEST_CASE("typed append interruption", boundary * 100 + after * 10 + survive);
+                new_db(&db);
+                typed_input(records, 10);
+                fail_operation = boundary;
+                fail_after = after;
+                assert(timelite_batches_append_typed(&db, records, 64, scratch, sizeof(scratch), &sequence) == EIO);
+                if (survive)
+                {
+                    persist(1);
+                }
+                crash();
+                assert(timelite_batches_init(&db) == 0);
+                assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
+                assert(db.private_sequence == (uint64_t)((boundary == 3 && after && survive) || (boundary == 4 && (after || survive))));
+                if (db.private_sequence)
+                {
+                    typed_read_check(&db, 10, scratch, sizeof(scratch));
+                }
+                assert(timelite_batches_close(&db) == 0);
+            }
+        }
+    }
+    /* Torn body prefixes: only a complete valid header licenses suffix removal. */
+    for (boundary = 0; boundary < 1568; boundary++)
+    {
+        TEST_CASE("typed torn body", boundary);
+        new_db(&db);
+        typed_input(records, 10);
+        transfer_limit = (size_t)boundary;
+        assert(timelite_batches_append_typed(&db, records, 64, scratch, sizeof(scratch), &sequence) == EIO);
+        persist(1);
+        crash();
+        assert(timelite_batches_init(&db) == 0);
+        result = open_db(&db, TIMELITE_OPEN_EXISTING);
+        assert(result == ((boundary == 0 || boundary >= 32) ? 0 : TIMELITE_INVALID_DATABASE));
+        if (result == 0)
+        {
+            assert(db.private_sequence == 0);
+            assert(timelite_batches_close(&db) == 0);
+        }
+    }
+    for (boundary = 0; boundary < 32; boundary++)
+    {
+        TEST_CASE("typed torn commit", boundary);
+        new_db(&db);
+        typed_input(records, 10);
+        short_operation = 3;
+        transfer_limit = (size_t)boundary;
+        assert(timelite_batches_append_typed(&db, records, 64, scratch, sizeof(scratch), &sequence) == EIO);
+        persist(1);
+        crash();
+        assert(timelite_batches_init(&db) == 0);
+        assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
+        assert(db.private_sequence == 0 && files[1].length == 32);
+        assert(timelite_batches_close(&db) == 0);
+    }
+    /* On-disk invalid tags/nonfinite values with valid checksums fail closed. */
+    for (kind = 0; kind < 3; kind++)
+    {
+        TEST_CASE("typed invalid payload", kind);
+        new_db(&db);
+        typed_input(records, 10);
+        assert(timelite_batches_append_typed(&db, records, 1, scratch, sizeof(scratch), &sequence) == 0);
+        assert(timelite_batches_close(&db) == 0);
+        if (kind == 0)
+        {
+            encode_fixture32(wal_bytes + 84, 2);
+        }
+        else if (kind == 1)
+        {
+            memset(wal_bytes + 76, 0, 8);
+            wal_bytes[82] = 0xf0;
+            wal_bytes[83] = 0x7f;
+        }
+        else
+        {
+            encode_fixture32(wal_bytes + 56, 16);
+        }
+        fixture_crc(wal_bytes + 32, 28);
+        encode_fixture32(wal_bytes + 112, 0);
+        {
+            uint32_t crc = UINT32_MAX;
+            size_t i;
+            unsigned int bit;
+            for (i = 32; i < 88; i++)
+            {
+                crc ^= wal_bytes[i];
+                for (bit = 0; bit < 8; bit++)
+                {
+                    crc = (crc >> 1) ^ ((crc & 1) ? UINT32_C(0xedb88320) : 0);
+                }
+            }
+            encode_fixture32(wal_bytes + 112, ~crc);
+        }
+        fixture_crc(wal_bytes + 88, 28);
+        assert(open_db(&db, TIMELITE_OPEN_EXISTING) == TIMELITE_INVALID_DATABASE);
+    }
+    /* Version 2 still reads and writes its exact integer frames, without upgrade. */
+    new_db(&db);
+    assert(timelite_batches_close(&db) == 0);
+    encode_fixture32(database_bytes + 8, 2);
+    encode_fixture32(wal_bytes + 8, 2);
+    fixture_crc(database_bytes, 28);
+    fixture_crc(wal_bytes, 28);
+    assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
+    typed_input(records, 10);
+    assert(timelite_batches_append_typed(&db, records, 1, scratch, sizeof(scratch), &sequence) == TIMELITE_UNSUPPORTED_VERSION);
+    records[0].value.type = TIMELITE_VALUE_INT64;
+    records[0].value.data.integer = INT64_MAX;
+    assert(timelite_batches_append_typed(&db, records, 1, scratch, sizeof(scratch), &sequence) == 0);
+    assert(wal_bytes[8] == 2 && database_bytes[8] == 2 && wal_bytes[56] == 0);
+    {
+        struct timelite_typed_record result;
+        size_t count;
+        assert(timelite_batches_next_typed(&db, &result, 1, &count, &sequence, scratch, sizeof(scratch)) == 0);
+        typed_equal(&result.value, &records[0].value);
+    }
+    assert(checkpoint(&db) == 0);
+    assert(timelite_batches_close(&db) == 0);
+    assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
+    assert(wal_bytes[8] == 2 && database_bytes[8] == 2);
+    assert(timelite_batches_close(&db) == 0);
+}
+
+static void typed_disabled_tests(void)
+{
+    struct timelite_batches db, before;
+    struct timelite_typed_record record;
+    struct timelite_typed_record result;
+    uint64_t sequence = 99;
+    size_t count = 99;
+    int previous_writes;
+    TEST_CASE("unsupported binary64 keeps integer API usable", 0);
+    new_db(&db);
+    record.series = 1;
+    record.timestamp_us = 10;
+    record.value.type = TIMELITE_VALUE_FLOAT64;
+    record.value.data.floating = 0.0;
+    before = db;
+    previous_writes = writes;
+    assert(timelite_batches_append_typed(&db, &record, 1, scratch, sizeof(scratch), &sequence) == ENOTSUP);
+    assert(sequence == 99 && writes == previous_writes && memcmp(&db, &before, sizeof(db)) == 0);
+    record.value.type = TIMELITE_VALUE_INT64;
+    record.value.data.integer = INT64_MIN;
+    assert(timelite_batches_append_typed(&db, &record, 1, scratch, sizeof(scratch), &sequence) == 0);
+    assert(timelite_batches_next_typed(&db, &result, 1, &count, &sequence, scratch, sizeof(scratch)) == 0);
+    typed_equal(&result.value, &record.value);
+    assert(timelite_batches_close(&db) == 0);
+    /* Turn the integer payload into a valid -0.0 fixture, without executing
+     * any floating operation on a host whose representation is unsupported. */
+    encode_fixture32(wal_bytes + 84, 1);
+    {
+        uint32_t crc = UINT32_MAX;
+        size_t i;
+        unsigned int bit;
+        for (i = 32; i < 88; i++)
+        {
+            crc ^= wal_bytes[i];
+            for (bit = 0; bit < 8; bit++)
+            {
+                crc = (crc >> 1) ^ ((crc & 1) ? UINT32_C(0xedb88320) : 0);
+            }
+        }
+        encode_fixture32(wal_bytes + 112, ~crc);
+    }
+    fixture_crc(wal_bytes + 88, 28);
+    assert(open_db(&db, TIMELITE_OPEN_EXISTING) == 0);
+    before = db;
+    sequence = count = 99;
+    assert(timelite_batches_next_typed(&db, &result, 1, &count, &sequence, scratch, sizeof(scratch)) == ENOTSUP);
+    assert(count == 99 && sequence == 99 && memcmp(&db, &before, sizeof(db)) == 0);
+    assert(checkpoint(&db) == 0);
+    assert(timelite_batches_close(&db) == 0);
+}
+
 int main(void)
 {
     owner_lock_failures();
@@ -2009,6 +2360,14 @@ int main(void)
     retention_legacy_floor();
     retention_end_and_checkpoint();
     capacity();
+    if (timelite_float64_supported())
+    {
+        typed_model_tests();
+    }
+    else
+    {
+        typed_disabled_tests();
+    }
     puts("batch persisted/volatile model, checkpoint boundaries, recovery and 64 MiB capacity: passed");
     return 0;
 }

@@ -80,6 +80,7 @@ struct inspect_frame
 /* Everything verify learns, in the order the library's open learns it. */
 struct inspect_state
 {
+    uint32_t format_version;
     FILE *out;
     struct inspect_source database, wal;
     unsigned int problems;
@@ -162,6 +163,7 @@ static const char *inspect_error_name(int error)
         case TIMELITE_WAL_FULL: return "TIMELITE_WAL_FULL";
         case TIMELITE_PAIR_MISMATCH: return "TIMELITE_PAIR_MISMATCH";
         case TIMELITE_DATABASE_FULL: return "TIMELITE_DATABASE_FULL";
+        case TIMELITE_VALUE_TYPE_MISMATCH: return "TIMELITE_VALUE_TYPE_MISMATCH";
         case TIMELITE_OUT_OF_ORDER: return "TIMELITE_OUT_OF_ORDER";
         case EINVAL: return "EINVAL";
         case ENOENT: return "ENOENT";
@@ -282,7 +284,7 @@ static int inspect_pair_header(struct inspect_state *state, struct inspect_sourc
         inspect_problem(state, 8, label, "version 0");
         return TIMELITE_INVALID_DATABASE;
     }
-    if (version != 2)
+    if (version != 2 && version != 3)
     {
         inspect_problem(state, 8, label, version == 1 ?
                         "version 1 lifecycle file; the batch API rejects it without migration" :
@@ -291,7 +293,7 @@ static int inspect_pair_header(struct inspect_state *state, struct inspect_sourc
     }
     if (got < (long)INSPECT_HEADER)
     {
-        inspect_problem(state, (uint64_t)got, label, "version 2 header cut short");
+        inspect_problem(state, (uint64_t)got, label, "pair header cut short");
         return TIMELITE_INVALID_DATABASE;
     }
     if (inspect_checksum(header, 28) != inspect_decode32(header + 28))
@@ -504,6 +506,12 @@ static int inspect_segment_parse(struct inspect_source *source, uint64_t offset,
 /* Returns 0 valid, TIMELITE_END for a validated header whose declared end
  * passes `end` (incomplete suffix), TIMELITE_INVALID_DATABASE for damage,
  * EIO for a read error. */
+/* Feature 015: marker 15 selects tagged 24-byte records. */
+static size_t inspect_record_size(const unsigned char *frame)
+{
+    return inspect_decode32(frame + 24) == 15 ? 24 : INSPECT_RECORD;
+}
+
 static int inspect_frame_parse(struct inspect_source *source, uint64_t offset, uint64_t end,
                                uint64_t sequence, unsigned char *bytes, struct inspect_frame *frame)
 {
@@ -532,8 +540,8 @@ static int inspect_frame_parse(struct inspect_source *source, uint64_t offset, u
     }
     count = inspect_decode32(bytes + 16);
     if (memcmp(bytes, "TLBATCH!", 8) != 0 || count == 0 || count > TIMELITE_MAX_RECORDS ||
-        inspect_decode32(bytes + 20) != 32 + count * INSPECT_RECORD ||
-        inspect_decode32(bytes + 24) != 0 ||
+        inspect_decode32(bytes + 20) != 32 + count * inspect_record_size(bytes) ||
+        (inspect_decode32(bytes + 24) != 0 && inspect_decode32(bytes + 24) != 15) ||
         inspect_checksum(bytes, 28) != inspect_decode32(bytes + 28))
     {
         frame->reason = "frame header invalid";
@@ -579,7 +587,19 @@ static int inspect_frame_parse(struct inspect_source *source, uint64_t offset, u
     frame->records = count;
     for (i = 0; i < count; i++)
     {
-        uint64_t time = inspect_decode64(bytes + 32 + i * INSPECT_RECORD + 4);
+        uint64_t time = inspect_decode64(bytes + 32 + i * inspect_record_size(bytes) + 4);
+        if (inspect_record_size(bytes) == 24)
+        {
+            const unsigned char *record = bytes + 32 + i * 24;
+            uint32_t type = inspect_decode32(record + 20);
+            uint64_t bits = inspect_decode64(record + 12);
+            if (type > 1 || (type == 1 &&
+                (bits & UINT64_C(0x7ff0000000000000)) == UINT64_C(0x7ff0000000000000)))
+            {
+                frame->reason = "invalid value type or nonfinite binary64";
+                return TIMELITE_INVALID_DATABASE;
+            }
+        }
         if (i == 0)
         {
             frame->first_time = frame->minimum = frame->maximum = time;
@@ -636,7 +656,8 @@ static void inspect_headers(struct inspect_state *state)
     {
         inspect_predict(state, error, "wal header");
     }
-    else if (memcmp(header + 12, wal_header + 12, 16) != 0)
+    else if (memcmp(header + 12, wal_header + 12, 16) != 0 ||
+             inspect_decode32(header + 8) != inspect_decode32(wal_header + 8))
     {
         fprintf(state->out, "pair_identity=mismatch\n");
         inspect_problem(state, 12, "wal", "identity differs from the database identity");
@@ -644,6 +665,7 @@ static void inspect_headers(struct inspect_state *state)
     }
     else
     {
+        state->format_version = inspect_decode32(header + 8);
         fprintf(state->out, "pair_identity=match\n");
     }
 }
@@ -940,8 +962,8 @@ static void inspect_wal(struct inspect_state *state)
         }
         if (got < 32 || memcmp(inspect_bytes, "TLBATCH!", 8) != 0 || count == 0 ||
             count > TIMELITE_MAX_RECORDS ||
-            inspect_decode32(inspect_bytes + 20) != 32 + count * INSPECT_RECORD ||
-            inspect_decode32(inspect_bytes + 24) != 0 ||
+            inspect_decode32(inspect_bytes + 20) != 32 + count * inspect_record_size(inspect_bytes) ||
+            (inspect_decode32(inspect_bytes + 24) != 0 && inspect_decode32(inspect_bytes + 24) != 15) ||
             inspect_checksum(inspect_bytes, 28) != inspect_decode32(inspect_bytes + 28))
         {
             inspect_problem(state, 32, "wal", got < 32 ?
@@ -1125,6 +1147,7 @@ static void inspect_summary(struct inspect_state *state)
     {
         fprintf(out, "recovery.read_fails_at_sequence=%" PRIu64 "\n", state->unreadable);
     }
+    fprintf(out, "predicted.format_version=%" PRIu32 "\n", state->format_version);
     fprintf(out, "predicted.committed_batches=%" PRIu64 "\n", state->live + pending);
     fprintf(out, "predicted.installed_batches=%" PRIu64 "\n", state->live);
     fprintf(out, "predicted.pending_batches=%" PRIu64 "\n", pending);
@@ -1207,7 +1230,7 @@ static int inspect_status(const char *database_path, const char *wal_path, int d
                           const struct timelite_range *range, int have_from, FILE *out)
 {
     static unsigned char scratch[TIMELITE_BATCH_SCRATCH];
-    static struct timelite_record output[TIMELITE_MAX_RECORDS];
+    static struct timelite_typed_record output[TIMELITE_MAX_RECORDS];
     struct timelite_batches db;
     struct timelite_batches_status status;
     uint64_t sequence;
@@ -1231,6 +1254,7 @@ static int inspect_status(const char *database_path, const char *wal_path, int d
     error = timelite_batches_get_status(&db, &status);
     if (error == 0)
     {
+        fprintf(out, "format_version=%" PRIu32 "\n", status.format_version);
         fprintf(out, "committed_batches=%" PRIu64 "\n", status.committed_batches);
         fprintf(out, "installed_batches=%" PRIu64 "\n", status.installed_batches);
         fprintf(out, "pending_batches=%" PRIu64 "\n", status.pending_batches);
@@ -1257,18 +1281,29 @@ static int inspect_status(const char *database_path, const char *wal_path, int d
         {
             if (range != NULL)
             {
-                error = timelite_batches_next_range(&db, range, output, TIMELITE_MAX_RECORDS,
+                error = timelite_batches_next_range_typed(&db, range, output, TIMELITE_MAX_RECORDS,
                                                     &count, &sequence, scratch, sizeof(scratch));
             }
             else
             {
-                error = timelite_batches_next(&db, output, TIMELITE_MAX_RECORDS, &count,
+                error = timelite_batches_next_typed(&db, output, TIMELITE_MAX_RECORDS, &count,
                                               &sequence, scratch, sizeof(scratch));
             }
             for (i = 0; error == 0 && i < count; i++)
             {
-                fprintf(out, "batch=%" PRIu64 " series=%" PRIu32 " us=%" PRIu64 " value=%" PRId64 "\n",
-                        sequence, output[i].series, output[i].timestamp_us, output[i].value);
+                fprintf(out, "batch=%" PRIu64 " series=%" PRIu32 " us=%" PRIu64,
+                        sequence, output[i].series, output[i].timestamp_us);
+                if (output[i].value.type == TIMELITE_VALUE_INT64)
+                {
+                    fprintf(out, " value=%" PRId64 " type=int64\n", output[i].value.data.integer);
+                }
+                else
+                {
+                    uint64_t bits;
+                    memcpy(&bits, &output[i].value.data.floating, sizeof(bits));
+                    fprintf(out, " value=%.17g type=float64 bits=0x%016" PRIx64 "\n",
+                            output[i].value.data.floating, bits);
+                }
             }
         }
         if (error == TIMELITE_END)

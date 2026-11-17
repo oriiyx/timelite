@@ -19,6 +19,8 @@
 #define remove_test_directory rmdir
 #endif
 
+#include "typed_cases.h"
+
 static void encode_fixture(unsigned char *bytes, uint64_t value, size_t width)
 {
     size_t i;
@@ -782,6 +784,51 @@ static void retention_native(const char *path, const char *wal_path)
     assert(remove_test_file(wal_path) == 0);
 }
 
+static void typed_native(const char *path, const char *wal_path)
+{
+    struct timelite_batches db;
+    unsigned char work[TIMELITE_BATCH_SCRATCH];
+    struct timelite_typed_record records[64];
+    uint64_t sequence;
+    assert(timelite_batches_init(&db) == 0);
+    assert(timelite_batches_open(&db, path, wal_path, TIMELITE_CREATE_NEW, work, sizeof(work)) == 0);
+    typed_cases(&db, work, sizeof(work));
+    assert(timelite_batches_close(&db) == 0);
+    assert(timelite_batches_open(&db, path, wal_path, TIMELITE_OPEN_EXISTING, work, sizeof(work)) == 0);
+    typed_read_check(&db, 20, work, sizeof(work));
+    assert(timelite_batches_checkpoint(&db, work, sizeof(work)) == 0);
+    typed_input(records, 25);
+    assert(timelite_batches_append_typed(&db, records, 64, work, sizeof(work), &sequence) == 0);
+    assert(timelite_batches_checkpoint(&db, work, sizeof(work)) == 0);
+    assert(timelite_batches_expire_before(&db, 21, work, sizeof(work)) == 0);
+    assert(timelite_batches_close(&db) == 0);
+    assert(timelite_batches_open(&db, path, wal_path, TIMELITE_OPEN_EXISTING, work, sizeof(work)) == 0);
+    typed_read_check(&db, 25, work, sizeof(work));
+    typed_precision(&db, work, sizeof(work));
+    {
+        struct timelite_record integer = {999, 30, INT64_MAX};
+        struct timelite_range range = {0, 31, 999, 1};
+        struct timelite_typed_record result;
+        size_t count;
+        assert(timelite_batches_append(&db, &integer, 1, work, sizeof(work), &sequence) == 0);
+        assert(timelite_batches_checkpoint(&db, work, sizeof(work)) == 0);
+        assert(timelite_batches_close(&db) == 0);
+        assert(timelite_batches_open(&db, path, wal_path, TIMELITE_OPEN_EXISTING, work, sizeof(work)) == 0);
+        assert(timelite_batches_next_range_typed(&db, &range, &result, 1, &count, &sequence, work, sizeof(work)) == 0);
+        assert(result.value.type == TIMELITE_VALUE_INT64 && result.value.data.integer == INT64_MAX);
+        assert(timelite_batches_expire_before(&db, 31, work, sizeof(work)) == 0);
+        assert(timelite_batches_close(&db) == 0);
+        assert(timelite_batches_open(&db, path, wal_path, TIMELITE_OPEN_EXISTING, work, sizeof(work)) == 0);
+        assert(timelite_batches_next_typed(&db, &result, 1, &count, &sequence, work, sizeof(work)) == TIMELITE_END);
+        typed_input(records, 30);
+        assert(timelite_batches_append_typed(&db, records, 64, work, sizeof(work), &sequence) == 0);
+        typed_read_check(&db, 30, work, sizeof(work));
+    }
+    assert(timelite_batches_close(&db) == 0);
+    assert(remove_test_file(path) == 0);
+    assert(remove_test_file(wal_path) == 0);
+}
+
 int main(void)
 {
 #if defined(_WIN32)
@@ -885,7 +932,7 @@ int main(void)
     assert(timelite_file_open(&file, wal_path) == 0);
     assert(timelite_file_read(&file, 0, saved, sizeof(saved), &transferred) == 0);
     assert(transferred == sizeof(saved));
-    assert(memcmp(saved, "TIMEWAL!\2\0\0\0", 12) == 0);
+    assert(memcmp(saved, "TIMEWAL!\3\0\0\0", 12) == 0);
     assert(memcmp(saved + 32, "TLBATCH!\1\0\0\0\0\0\0\0\2\0\0\0H\0\0\0", 24) == 0);
     assert(saved[64] == 0 && saved[68] == 255 && saved[83] == 128);
     assert(memcmp(saved + 104, "TLCOMMIT", 8) == 0);
@@ -1097,6 +1144,7 @@ int main(void)
     }
     assert(remove_test_file(path) == 0);
     assert(remove_test_file(wal_path) == 0);
+    typed_native(path, wal_path);
     continuous_operation(path, wal_path);
     retention_native(path, wal_path);
     aggregate_ranges(path, wal_path);

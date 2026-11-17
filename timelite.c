@@ -3,6 +3,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <float.h>
 #include <string.h>
 
 typedef char timelite_byte_must_be_eight_bits[CHAR_BIT == 8 ? 1 : -1];
@@ -295,6 +296,7 @@ int timelite_batches_init(struct timelite_batches *db)
     }
     batch_set_file(db, file, 0);
     batch_set_file(db, file, 1);
+    db->private_format = 0;
     db->private_end = 32;
     db->private_sequence = 0;
     db->private_data_end = TIMELITE_DATA_START;
@@ -345,7 +347,7 @@ static int pair_header(struct timelite_file *file, unsigned char *header,
     {
         return TIMELITE_INVALID_DATABASE;
     }
-    if (decode32(header + 8) != 2)
+    if (decode32(header + 8) != 2 && decode32(header + 8) != 3)
     {
         return TIMELITE_UNSUPPORTED_VERSION;
     }
@@ -640,7 +642,7 @@ static int create_header(struct timelite_file *file, const char *magic,
     unsigned char header[160];
     memset(header, 0, sizeof(header));
     memcpy(header, magic, 8);
-    encode32(header + 8, 2);
+    encode32(header + 8, 3);
     memcpy(header + 12, identity, 16);
     encode32(header + 28, checksum(header, 28));
     if (database)
@@ -650,12 +652,62 @@ static int create_header(struct timelite_file *file, const char *magic,
     return write_exact(file, 0, header, database ? sizeof(header) : 32);
 }
 
+/* memcpy is used only after checking the native representation. */
+static uint64_t float_bits(const double *value)
+{
+    uint64_t bits;
+    memcpy(&bits, value, sizeof(bits));
+    return bits;
+}
+
+int timelite_float64_supported(void)
+{
+#if defined(__FAST_MATH__) || defined(TIMELITE_DISABLE_FLOAT64) || \
+    (defined(__FINITE_MATH_ONLY__) && __FINITE_MATH_ONLY__ > 0) || \
+    FLT_RADIX != 2 || DBL_MANT_DIG != 53 || DBL_MIN_EXP != -1021 || DBL_MAX_EXP != 1024
+    return 0;
+#else
+    const double values[] = {1.0, -0.0, -2.5, 0x1p-1074, 0x1.fffffffffffffp1023};
+    const uint64_t bits[] = {UINT64_C(0x3ff0000000000000), UINT64_C(0x8000000000000000),
+        UINT64_C(0xc004000000000000), UINT64_C(1), UINT64_C(0x7fefffffffffffff)};
+    size_t i;
+    if (sizeof(double) != 8)
+    {
+        return 0;
+    }
+    for (i = 0; i < sizeof(values) / sizeof(values[0]); i++)
+    {
+        if (float_bits(values + i) != bits[i])
+        {
+            return 0;
+        }
+    }
+    return 1;
+#endif
+}
+
+static size_t record_size(const void *frame)
+{
+    return decode32((const unsigned char *)frame + 24) == 15 ? 24 : 20;
+}
+
+static int record_type(const unsigned char *record, size_t stride)
+{
+    return stride == 20 ? 0 : (int)decode32(record + 20);
+}
+
+static int finite_bits(uint64_t bits)
+{
+    return (bits & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
+}
+
 static int check_frame_header(const unsigned char *bytes)
 {
     uint32_t count = decode32(bytes + 16);
     return memcmp(bytes, "TLBATCH!", 8) == 0 && count != 0 &&
            count <= TIMELITE_MAX_RECORDS &&
-           decode32(bytes + 20) == 32 + count * 20 && decode32(bytes + 24) == 0 &&
+           decode32(bytes + 20) == 32 + count * record_size(bytes) &&
+           (decode32(bytes + 24) == 0 || decode32(bytes + 24) == 15) &&
            checksum(bytes, 28) == decode32(bytes + 28);
 }
 
@@ -702,6 +754,19 @@ static int read_frame(struct timelite_file *file, uint64_t offset, uint64_t end,
         decode32(commit + 28) != checksum(commit, 28))
     {
         return TIMELITE_INVALID_DATABASE;
+    }
+    if (record_size(bytes) == 24)
+    {
+        size_t i;
+        for (i = 0; i < count; i++)
+        {
+            const unsigned char *record = bytes + 32 + i * 24;
+            uint32_t type = decode32(record + 20);
+            if (type > 1 || (type == 1 && !finite_bits(decode64(record + 12))))
+            {
+                return TIMELITE_INVALID_DATABASE;
+            }
+        }
     }
     *length = total;
     *records = count;
@@ -902,7 +967,7 @@ static int check_segments(struct timelite_file *database, uint64_t generation,
                 {
                     return error == TIMELITE_END ? TIMELITE_INVALID_DATABASE : error;
                 }
-                *last_time = decode64((unsigned char *)scratch + 36 + (records - 1) * 20);
+                *last_time = decode64((unsigned char *)scratch + 36 + (records - 1) * record_size(scratch));
                 frame += length;
                 frame_sequence++;
             }
@@ -935,7 +1000,7 @@ static int segment_expires(struct timelite_file *file, uint64_t offset,
         }
         for (i = 0; i < records; i++)
         {
-            if (decode64((unsigned char *)scratch + 36 + i * 20) >= cutoff)
+            if (decode64((unsigned char *)scratch + 36 + i * record_size(scratch)) >= cutoff)
             {
                 *expires = 0;
             }
@@ -1187,7 +1252,8 @@ int timelite_batches_open(struct timelite_batches *db, const char *database_path
     {
         error = pair_header(&wal, wal_header, "TIMEWAL!");
     }
-    if (error == 0 && memcmp(header + 12, wal_header + 12, 16) != 0)
+    if (error == 0 && (memcmp(header + 12, wal_header + 12, 16) != 0 ||
+                       decode32(header + 8) != decode32(wal_header + 8)))
     {
         error = TIMELITE_PAIR_MISMATCH;
     }
@@ -1257,7 +1323,7 @@ int timelite_batches_open(struct timelite_batches *db, const char *database_path
         }
         for (i = 0; i < records; i++)
         {
-            uint64_t time = decode64((unsigned char *)scratch + 36 + i * 20);
+            uint64_t time = decode64((unsigned char *)scratch + 36 + i * record_size(scratch));
             if (offset == 32 && i == 0)
             {
                 wal_first = wal_minimum = wal_maximum = time;
@@ -1328,6 +1394,7 @@ int timelite_batches_open(struct timelite_batches *db, const char *database_path
     }
     batch_set_file(db, database, 0);
     batch_set_file(db, wal, 1);
+    db->private_format = decode32(header + 8);
     db->private_end = offset;
     db->private_sequence = sequence;
     db->private_data_end = data_end;
@@ -1387,6 +1454,7 @@ int timelite_batches_get_status(struct timelite_batches *db,
     {
         return error;
     }
+    status->format_version = db->private_format;
     status->committed_batches = db->private_live_batches +
                                 (db->private_sequence - db->private_installed);
     status->installed_batches = db->private_live_batches;
@@ -1398,21 +1466,23 @@ int timelite_batches_get_status(struct timelite_batches *db,
     return 0;
 }
 
-int timelite_batches_append(struct timelite_batches *db,
-                            const struct timelite_record *records, size_t count,
+static int append_records(struct timelite_batches *db,
+                            const struct timelite_record *records,
+                            const struct timelite_typed_record *typed, size_t count,
                             void *scratch, size_t scratch_size, uint64_t *sequence)
 {
     unsigned char *bytes = scratch;
     unsigned char *commit;
     struct timelite_file wal;
     uint64_t next;
-    size_t i, body_length;
+    size_t i, body_length, stride = typed == NULL ? 20 : 24;
+    struct timelite_record converted[TIMELITE_MAX_RECORDS];
     int error = batch_ready(db);
     if (error != 0)
     {
         return error;
     }
-    if (records == NULL || count == 0 || count > TIMELITE_MAX_RECORDS ||
+    if ((records == NULL && typed == NULL) || count == 0 || count > TIMELITE_MAX_RECORDS ||
         scratch == NULL || sequence == NULL)
     {
         return EINVAL;
@@ -1420,6 +1490,41 @@ int timelite_batches_append(struct timelite_batches *db,
     if (scratch_size < TIMELITE_BATCH_SCRATCH)
     {
         return TIMELITE_BUFFER_TOO_SMALL;
+    }
+    if (typed != NULL)
+    {
+        for (i = 0; i < count; i++)
+        {
+            if (typed[i].value.type != TIMELITE_VALUE_INT64 &&
+                typed[i].value.type != TIMELITE_VALUE_FLOAT64)
+            {
+                return EINVAL;
+            }
+            if (typed[i].value.type == TIMELITE_VALUE_FLOAT64)
+            {
+                if (!timelite_float64_supported())
+                {
+                    return ENOTSUP;
+                }
+                if (!finite_bits(float_bits(&typed[i].value.data.floating)))
+                {
+                    return EINVAL;
+                }
+                if (db->private_format != 3)
+                {
+                    return TIMELITE_UNSUPPORTED_VERSION;
+                }
+            }
+            converted[i].series = typed[i].series;
+            converted[i].timestamp_us = typed[i].timestamp_us;
+            converted[i].value = typed[i].value.type == TIMELITE_VALUE_INT64 ?
+                                 typed[i].value.data.integer : 0;
+        }
+        records = converted;
+        if (db->private_format == 2)
+        {
+            stride = 20;
+        }
     }
     for (i = 0; i < count; i++)
     {
@@ -1430,7 +1535,7 @@ int timelite_batches_append(struct timelite_batches *db,
             return TIMELITE_OUT_OF_ORDER;
         }
     }
-    body_length = 32 + count * 20;
+    body_length = 32 + count * stride;
     if (body_length + 32 > TIMELITE_WAL_CAPACITY - db->private_end)
     {
         return TIMELITE_WAL_FULL;
@@ -1444,14 +1549,19 @@ int timelite_batches_append(struct timelite_batches *db,
     encode64(bytes + 8, next);
     encode32(bytes + 16, (uint32_t)count);
     encode32(bytes + 20, (uint32_t)body_length);
-    encode32(bytes + 24, 0);
+    encode32(bytes + 24, stride == 24 ? 15 : 0);
     encode32(bytes + 28, checksum(bytes, 28));
     for (i = 0; i < count; i++)
     {
-        unsigned char *record = bytes + 32 + i * 20;
+        unsigned char *record = bytes + 32 + i * record_size(scratch);
         encode32(record, records[i].series);
         encode64(record + 4, records[i].timestamp_us);
-        encode64(record + 12, (uint64_t)records[i].value);
+        encode64(record + 12, typed != NULL && typed[i].value.type == TIMELITE_VALUE_FLOAT64 ?
+                 float_bits(&typed[i].value.data.floating) : (uint64_t)records[i].value);
+        if (stride == 24)
+        {
+            encode32(record + 20, (uint32_t)typed[i].value.type);
+        }
     }
     commit = bytes + body_length;
     memcpy(commit, "TLCOMMIT", 8);
@@ -1898,17 +2008,53 @@ static void copy_cursor(struct timelite_batches *destination,
     destination->private_in_wal = source->private_in_wal;
 }
 
-static void decode_record(const unsigned char *record, struct timelite_record *out)
+static void decode_record(const unsigned char *record, size_t stride,
+                           void *output, size_t index, int typed)
 {
-    uint64_t value = decode64(record + 12);
-    out->series = decode32(record);
-    out->timestamp_us = decode64(record + 4);
-    out->value = value <= INT64_MAX ? (int64_t)value :
-                 -1 - (int64_t)(UINT64_MAX - value);
+    uint64_t bits = decode64(record + 12);
+    int64_t integer = bits <= INT64_MAX ? (int64_t)bits : -1 - (int64_t)(UINT64_MAX - bits);
+    if (typed)
+    {
+        struct timelite_typed_record *out = (struct timelite_typed_record *)output + index;
+        out->series = decode32(record);
+        out->timestamp_us = decode64(record + 4);
+        out->value.type = (enum timelite_value_type)record_type(record, stride);
+        if (out->value.type == TIMELITE_VALUE_FLOAT64)
+        {
+            memcpy(&out->value.data.floating, &bits, sizeof(bits));
+        }
+        else
+        {
+            out->value.data.integer = integer;
+        }
+    }
+    else
+    {
+        struct timelite_record *out = (struct timelite_record *)output + index;
+        out->series = decode32(record);
+        out->timestamp_us = decode64(record + 4);
+        out->value = integer;
+    }
 }
 
-int timelite_batches_next(struct timelite_batches *db,
-                          struct timelite_record *records, size_t capacity,
+static int output_type(const unsigned char *record, size_t stride, int typed)
+{
+    if (record_type(record, stride) == 1)
+    {
+        if (!typed)
+        {
+            return TIMELITE_VALUE_TYPE_MISMATCH;
+        }
+        if (!timelite_float64_supported())
+        {
+            return ENOTSUP;
+        }
+    }
+    return 0;
+}
+
+static int next_records(struct timelite_batches *db,
+                          void *records, int typed, size_t capacity,
                           size_t *count, uint64_t *sequence,
                           void *scratch, size_t scratch_size)
 {
@@ -1941,7 +2087,17 @@ int timelite_batches_next(struct timelite_batches *db,
     }
     for (i = 0; i < found; i++)
     {
-        decode_record((unsigned char *)scratch + 32 + i * 20, records + i);
+        error = output_type((unsigned char *)scratch + 32 + i * record_size(scratch),
+                            record_size(scratch), typed);
+        if (error != 0)
+        {
+            return error;
+        }
+    }
+    for (i = 0; i < found; i++)
+    {
+        decode_record((unsigned char *)scratch + 32 + i * record_size(scratch),
+                      record_size(scratch), records, i, typed);
     }
     *count = found;
     *sequence = batch;
@@ -1974,7 +2130,7 @@ static int seek_frames(struct timelite_batches *cursor, uint64_t from_us,
         {
             return error;
         }
-        if (decode64((unsigned char *)scratch + 36 + (count - 1) * 20) >= from_us)
+        if (decode64((unsigned char *)scratch + 36 + (count - 1) * record_size(scratch)) >= from_us)
         {
             return 0;
         }
@@ -2076,9 +2232,9 @@ static int record_matches(const unsigned char *record, const struct timelite_ran
            (!range->filter_series || decode32(record) == range->series);
 }
 
-int timelite_batches_next_range(struct timelite_batches *db,
+static int next_range_records(struct timelite_batches *db,
                                 const struct timelite_range *range,
-                                struct timelite_record *records, size_t capacity,
+                                void *records, int typed, size_t capacity,
                                 size_t *count, uint64_t *sequence,
                                 void *scratch, size_t scratch_size)
 {
@@ -2151,7 +2307,16 @@ int timelite_batches_next_range(struct timelite_batches *db,
         matches = 0;
         for (i = 0; i < found; i++)
         {
-            matches += (size_t)record_matches((unsigned char *)scratch + 32 + i * 20, range);
+            const unsigned char *record = (unsigned char *)scratch + 32 + i * record_size(scratch);
+            if (record_matches(record, range))
+            {
+                error = output_type(record, record_size(scratch), typed);
+                if (error != 0)
+                {
+                    return error;
+                }
+                matches++;
+            }
         }
         if (matches != 0)
         {
@@ -2162,10 +2327,10 @@ int timelite_batches_next_range(struct timelite_batches *db,
             matches = 0;
             for (i = 0; i < found; i++)
             {
-                const unsigned char *record = (unsigned char *)scratch + 32 + i * 20;
+                const unsigned char *record = (unsigned char *)scratch + 32 + i * record_size(scratch);
                 if (record_matches(record, range))
                 {
-                    decode_record(record, records + matches++);
+                    decode_record(record, record_size(scratch), records, matches++, typed);
                 }
             }
             *count = matches;
@@ -2224,6 +2389,189 @@ int timelite_batches_aggregate_range(struct timelite_batches *db,
                 aggregate.maximum_value = records[i].value;
             }
             /* File capacity bounds the number of records well below UINT64_MAX. */
+            aggregate.record_count++;
+        }
+    }
+    if (error != TIMELITE_END)
+    {
+        return error;
+    }
+    *result = aggregate;
+    return 0;
+}
+
+int timelite_batches_append(struct timelite_batches *db,
+                            const struct timelite_record *records, size_t count,
+                            void *scratch, size_t scratch_size, uint64_t *sequence)
+{
+    return append_records(db, records, NULL, count, scratch, scratch_size, sequence);
+}
+
+int timelite_batches_append_typed(struct timelite_batches *db,
+                                  const struct timelite_typed_record *records, size_t count,
+                                  void *scratch, size_t scratch_size, uint64_t *sequence)
+{
+    return append_records(db, NULL, records, count, scratch, scratch_size, sequence);
+}
+
+int timelite_batches_next(struct timelite_batches *db,
+                          struct timelite_record *records, size_t capacity,
+                          size_t *count, uint64_t *sequence, void *scratch, size_t scratch_size)
+{
+    return next_records(db, records, 0, capacity, count, sequence, scratch, scratch_size);
+}
+
+int timelite_batches_next_typed(struct timelite_batches *db,
+                                struct timelite_typed_record *records, size_t capacity,
+                                size_t *count, uint64_t *sequence, void *scratch, size_t scratch_size)
+{
+    return next_records(db, records, 1, capacity, count, sequence, scratch, scratch_size);
+}
+
+int timelite_batches_next_range(struct timelite_batches *db,
+                                const struct timelite_range *range,
+                                struct timelite_record *records, size_t capacity,
+                                size_t *count, uint64_t *sequence, void *scratch, size_t scratch_size)
+{
+    return next_range_records(db, range, records, 0, capacity, count, sequence, scratch, scratch_size);
+}
+
+int timelite_batches_next_range_typed(struct timelite_batches *db,
+                                      const struct timelite_range *range,
+                                      struct timelite_typed_record *records, size_t capacity,
+                                      size_t *count, uint64_t *sequence, void *scratch, size_t scratch_size)
+{
+    return next_range_records(db, range, records, 1, capacity, count, sequence, scratch, scratch_size);
+}
+
+/* Compare an unsigned integer with the magnitude of a finite binary64.
+ * Split the float into its integer part and a nonzero-fraction flag. Shifts
+ * are bounded explicitly; no integer is rounded to floating point. */
+static int compare_magnitude(uint64_t integer, uint64_t bits)
+{
+    int exponent = (int)(bits >> 52) - 1023;
+    uint64_t significand = (bits & UINT64_C(0xfffffffffffff)) | UINT64_C(0x10000000000000);
+    uint64_t whole;
+    int fraction = 0;
+    if (bits == 0)
+    {
+        return integer != 0;
+    }
+    if (exponent < 0)
+    {
+        return integer == 0 ? -1 : 1;
+    }
+    if (exponent >= 64)
+    {
+        return -1;
+    }
+    if (exponent >= 52)
+    {
+        whole = significand << (exponent - 52);
+    }
+    else
+    {
+        unsigned int shift = (unsigned int)(52 - exponent);
+        whole = significand >> shift;
+        fraction = (significand & ((UINT64_C(1) << shift) - 1)) != 0;
+    }
+    if (integer < whole)
+    {
+        return -1;
+    }
+    if (integer > whole)
+    {
+        return 1;
+    }
+    return fraction ? -1 : 0;
+}
+
+static int compare_values(const struct timelite_value *a, const struct timelite_value *b)
+{
+    uint64_t x, y;
+    int negative_a, negative_b, order;
+    if (a->type == TIMELITE_VALUE_INT64 && b->type == TIMELITE_VALUE_INT64)
+    {
+        return (a->data.integer > b->data.integer) - (a->data.integer < b->data.integer);
+    }
+    if (a->type == TIMELITE_VALUE_FLOAT64 && b->type == TIMELITE_VALUE_INT64)
+    {
+        return -compare_values(b, a);
+    }
+    y = float_bits(&b->data.floating);
+    negative_b = (int)(y >> 63);
+    y &= UINT64_C(0x7fffffffffffffff);
+    if (y == 0)
+    {
+        negative_b = 0;
+    }
+    if (a->type == TIMELITE_VALUE_INT64)
+    {
+        negative_a = a->data.integer < 0;
+        x = negative_a ? (uint64_t)(-(a->data.integer + 1)) + 1 : (uint64_t)a->data.integer;
+    }
+    else
+    {
+        x = float_bits(&a->data.floating);
+        negative_a = (int)(x >> 63);
+        x &= UINT64_C(0x7fffffffffffffff);
+        if (x == 0)
+        {
+            negative_a = 0;
+        }
+    }
+    if (negative_a != negative_b)
+    {
+        return negative_a ? -1 : 1;
+    }
+    order = a->type == TIMELITE_VALUE_INT64 ? compare_magnitude(x, y) : (x > y) - (x < y);
+    return negative_a ? -order : order;
+}
+
+int timelite_batches_aggregate_range_typed(struct timelite_batches *db,
+                                          const struct timelite_range *range,
+                                          struct timelite_typed_aggregate *result,
+                                          void *scratch, size_t scratch_size)
+{
+    struct timelite_batches cursor;
+    struct timelite_typed_aggregate aggregate;
+    struct timelite_typed_record records[TIMELITE_MAX_RECORDS];
+    size_t count, i;
+    uint64_t sequence;
+    int error = batch_ready(db);
+    if (error != 0)
+    {
+        return error;
+    }
+    if (range == NULL || range->from_us > range->until_us ||
+        (range->filter_series != 0 && range->filter_series != 1) || result == NULL)
+    {
+        return EINVAL;
+    }
+    error = read_arguments(db, scratch, scratch_size);
+    if (error != 0)
+    {
+        return error;
+    }
+    aggregate.record_count = 0;
+    aggregate.minimum_value.type = TIMELITE_VALUE_INT64;
+    aggregate.minimum_value.data.integer = 0;
+    aggregate.maximum_value = aggregate.minimum_value;
+    cursor = *db;
+    reset_cursor(&cursor);
+    while ((error = timelite_batches_next_range_typed(&cursor, range, records,
+             TIMELITE_MAX_RECORDS, &count, &sequence, scratch, scratch_size)) == 0)
+    {
+        for (i = 0; i < count; i++)
+        {
+            if (aggregate.record_count == 0 || compare_values(&records[i].value, &aggregate.minimum_value) < 0)
+            {
+                aggregate.minimum_value = records[i].value;
+            }
+            if (aggregate.record_count == 0 || compare_values(&records[i].value, &aggregate.maximum_value) > 0)
+            {
+                aggregate.maximum_value = records[i].value;
+            }
             aggregate.record_count++;
         }
     }

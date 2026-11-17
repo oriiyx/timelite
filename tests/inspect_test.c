@@ -577,13 +577,13 @@ int main(void)
     EXPECT("timestamp_max_us=20");
     EXPECT("predicted.installed_bytes=148");
     assert(status(path2, wal2_path, 1) == 0);
-    EXPECT("batch=1 series=7 us=10 value=100");
-    EXPECT("batch=2 series=7 us=20 value=200");
+    EXPECT("batch=1 series=7 us=10 value=100 type=int64");
+    EXPECT("batch=2 series=7 us=20 value=200 type=int64");
     filtered[2] = path2;
     filtered[3] = wal2_path;
     assert(run_tool(11, filtered) == 0);
-    assert(!has_line("batch=1 series=7 us=10 value=100"));
-    EXPECT("batch=2 series=7 us=20 value=200");
+    assert(!has_line("batch=1 series=7 us=10 value=100 type=int64"));
+    EXPECT("batch=2 series=7 us=20 value=200 type=int64");
     bad_filter[2] = path2;
     bad_filter[3] = wal2_path;
     assert(run_tool(6, bad_filter) == 2);
@@ -755,10 +755,71 @@ int main(void)
         EXPECT("wal_trailing_bytes=0");
         EXPECT("inconsistencies=0");
         assert(status(path, wal_path, 1) == 0);
-        EXPECT("batch=3 series=8 us=30 value=300");
+        EXPECT("batch=3 series=8 us=30 value=300 type=int64");
         remove_pair(path, wal_path);
     }
     assert(seen_prepare && seen_tail && seen_cleanup);
+
+    /* Typed frames are parsed independently, dumped explicitly, and retained
+     * byte-for-byte through recovery of interrupted copies. */
+    TEST_CASE("typed inspection", 0);
+    assert(open_pair(path, wal_path, TIMELITE_CREATE_NEW) == 0);
+    {
+        struct timelite_typed_record records[3] = {
+            {7, 10, {TIMELITE_VALUE_INT64, {.integer = INT64_MAX}}},
+            {8, 10, {TIMELITE_VALUE_FLOAT64, {.floating = -0.0}}},
+            {9, 10, {TIMELITE_VALUE_FLOAT64, {.floating = -1.25}}}
+        };
+        uint64_t sequence;
+        assert(timelite_batches_append_typed(&db, records, 3, scratch, sizeof(scratch), &sequence) == 0);
+        checkpoint();
+        records[0].timestamp_us = records[1].timestamp_us = records[2].timestamp_us = 20;
+        assert(timelite_batches_append_typed(&db, records, 3, scratch, sizeof(scratch), &sequence) == 0);
+        checkpoint();
+        assert(timelite_batches_close(&db) == 0);
+        assert(agree(path, wal_path, 0) == 0);
+        EXPECT("database_version=3");
+        assert(status(path, wal_path, 1) == 0);
+        EXPECT("format_version=3");
+        EXPECT("batch=1 series=7 us=10 value=9223372036854775807 type=int64");
+        EXPECT("batch=1 series=8 us=10 value=-0 type=float64 bits=0x8000000000000000");
+        EXPECT("batch=1 series=9 us=10 value=-1.25 type=float64 bits=0xbff4000000000000");
+        db_length = read_file(path, saved_db);
+        wal_length = read_file(wal_path, saved_wal);
+        assert(open_pair(path, wal_path, TIMELITE_OPEN_EXISTING) == 0);
+        operation = 0;
+        assert(timelite_batches_expire_before(&db, 15, scratch, sizeof(scratch)) == 0);
+        total = operation;
+        assert(timelite_batches_close(&db) == 0);
+        for (k = 1; k <= total; k++)
+        {
+            TEST_CASE("typed inspection interrupted retention", k);
+            write_file(path, saved_db, db_length);
+            write_file(wal_path, saved_wal, wal_length);
+            assert(open_pair(path, wal_path, TIMELITE_OPEN_EXISTING) == 0);
+            operation = 0;
+            fail_at = k;
+            assert(timelite_batches_expire_before(&db, 15, scratch, sizeof(scratch)) == EIO);
+            fail_at = 0;
+            assert(timelite_batches_close(&db) == 0);
+            assert(agree(path, wal_path, 0) == 0);
+            assert(status(path, wal_path, 1) == 0);
+            EXPECT("batch=2 series=8 us=20 value=-0 type=float64 bits=0x8000000000000000");
+        }
+        /* Complete committed nonfinite payload, with valid CRCs. */
+        remove_pair(path, wal_path);
+        assert(open_pair(path, wal_path, TIMELITE_CREATE_NEW) == 0);
+        assert(timelite_batches_append_typed(&db, records + 1, 1, scratch, sizeof(scratch), &sequence) == 0);
+        assert(timelite_batches_close(&db) == 0);
+        wal_length = read_file(wal_path, image);
+        encode_fixture(image + 76, UINT64_C(0x7ff0000000000000), 8);
+        encode_fixture(image + 112, inspect_checksum(image + 32, 56), 4);
+        encode_fixture(image + 116, inspect_checksum(image + 88, 28), 4);
+        write_file(wal_path, image, wal_length);
+        assert(agree(path, wal_path, 1) == 1);
+        EXPECT("recovery.result=TIMELITE_INVALID_DATABASE");
+    }
+    remove_pair(path, wal_path);
 
     assert(remove_test_file(v1_path) == 0);
     assert(remove_test_file(capture_path) == 0);

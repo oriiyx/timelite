@@ -58,11 +58,11 @@ int timelite_close(struct timelite_db *db);
 /* The returned string belongs to the library. Do not modify or free it. */
 const char *timelite_version(void);
 
-/* Version 2 WAL batch API. Separate handle preserves the v1 lifecycle API.
+/* WAL batch API: new pairs use version 3; existing version 2 pairs remain readable. Separate handle preserves the v1 lifecycle API.
  * All fields private. Initialize fresh/closed storage, never copy an open handle.
  * Input, output, scratch and handles must not overlap. No buffers are retained. */
 #define TIMELITE_MAX_RECORDS 64u
-#define TIMELITE_BATCH_SCRATCH 1344u
+#define TIMELITE_BATCH_SCRATCH 1600u
 #define TIMELITE_WAL_CAPACITY UINT64_C(67108864)
 /* Main database file limit including headers and retention's temporary copy. */
 #define TIMELITE_DATABASE_CAPACITY UINT64_C(1073741824)
@@ -73,6 +73,7 @@ const char *timelite_version(void);
 #define TIMELITE_PAIR_MISMATCH (-7)
 #define TIMELITE_DATABASE_FULL (-8)
 #define TIMELITE_OUT_OF_ORDER (-9)
+#define TIMELITE_VALUE_TYPE_MISMATCH (-10)
 
 struct timelite_record
 {
@@ -80,6 +81,39 @@ struct timelite_record
     uint64_t timestamp_us;
     int64_t value;
 };
+
+enum timelite_value_type
+{
+    TIMELITE_VALUE_INT64 = 0,
+    TIMELITE_VALUE_FLOAT64 = 1
+};
+
+struct timelite_value
+{
+    enum timelite_value_type type;
+    union
+    {
+        int64_t integer;
+        double floating;
+    } data;
+};
+
+struct timelite_typed_record
+{
+    uint32_t series;
+    uint64_t timestamp_us;
+    struct timelite_value value;
+};
+
+struct timelite_typed_aggregate
+{
+    uint64_t record_count;
+    struct timelite_value minimum_value;
+    struct timelite_value maximum_value;
+};
+
+/* Runtime representation check. Unsupported hosts retain integer operations. */
+int timelite_float64_supported(void);
 
 struct timelite_batches
 {
@@ -90,6 +124,7 @@ struct timelite_batches
     int private_database;
     int private_wal;
 #endif
+    unsigned int private_format;
     uint64_t private_end;
     uint64_t private_sequence;
     uint64_t private_cursor;
@@ -125,6 +160,7 @@ struct timelite_batches_status
     uint64_t wal_bytes; /* Committed WAL extent, including its 32-byte header. */
     uint64_t installed_bytes; /* Segment headers and frames, excluding prefix. */
     uint64_t last_timestamp_us; /* Historical append floor, even after all data expires. */
+    uint32_t format_version; /* Pair header version, 2 or 3. */
 };
 
 /* Uses handle metadata only: no I/O, scratch, allocation or scans.
@@ -251,6 +287,30 @@ int timelite_batches_aggregate_range(struct timelite_batches *db,
                                      const struct timelite_range *range,
                                      struct timelite_aggregate *result,
                                      void *scratch, size_t scratch_size);
+/* Typed variants preserve finite binary64 payload bits, including signed zero.
+ * NaN/infinity and unknown input tags: EINVAL before effects. Float operations
+ * require timelite_float64_supported(), otherwise ENOTSUP. Float append to an
+ * existing v2 pair: UNSUPPORTED_VERSION (no migration). New pairs are v3.
+ * Integer readers reject selected floats with VALUE_TYPE_MISMATCH, preserving
+ * output/cursor. All other ownership, filtering and error rules are unchanged.
+ * Mixed extrema compare exactly; equal values retain the first input. Empty
+ * extrema are integer zero. No integer is converted to double. */
+int timelite_batches_append_typed(struct timelite_batches *db,
+                                  const struct timelite_typed_record *records, size_t count,
+                                  void *scratch, size_t scratch_size, uint64_t *sequence);
+int timelite_batches_next_typed(struct timelite_batches *db,
+                                struct timelite_typed_record *records, size_t capacity,
+                                size_t *count, uint64_t *sequence,
+                                void *scratch, size_t scratch_size);
+int timelite_batches_next_range_typed(struct timelite_batches *db,
+                                      const struct timelite_range *range,
+                                      struct timelite_typed_record *records, size_t capacity,
+                                      size_t *count, uint64_t *sequence,
+                                      void *scratch, size_t scratch_size);
+int timelite_batches_aggregate_range_typed(struct timelite_batches *db,
+                                          const struct timelite_range *range,
+                                          struct timelite_typed_aggregate *result,
+                                          void *scratch, size_t scratch_size);
 int timelite_batches_rewind(struct timelite_batches *db);
 /* Consumes both resources even if one close fails; returns first error. */
 int timelite_batches_close(struct timelite_batches *db);

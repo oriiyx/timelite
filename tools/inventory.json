@@ -1,4 +1,11 @@
 [
+  {"name": "typed", "source": "examples/typed.c", "backend": "library",
+   "platforms": ["posix", "windows"], "execution": "batch-example",
+   "coverage": "typed integer/binary64 append, checkpoint and exact mixed aggregation",
+   "stdout": "count=2 min=float64:-0.125 max=int64:9007199254740993\n"},
+  {"name": "batch_model_no_float", "source": "tests/batch_model_test.c", "backend": "fake",
+   "defines": ["TIMELITE_DISABLE_FLOAT64"], "platforms": ["posix", "windows"],
+   "coverage": "integer model regression and explicit rejection with binary64 support disabled"},
   {"name": "target_workload", "source": "tools/target/workload.c", "backend": "library",
    "platforms": ["posix", "windows"], "coverage": "bounded target workload build and usage smoke"},
   {"name": "timelite-inspect", "source": "tools/inspect/inspect.c", "backend": "library",
